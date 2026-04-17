@@ -1,5 +1,37 @@
 # Changelog
 
+## [beta](https://github.com/PathOfBuildingCommunity/PathOfBuilding-PoE2/tree/beta) (2026/04/17)
+
+[Full Changelog](https://github.com/PathOfBuildingCommunity/PathOfBuilding-PoE2/compare/v0.15.0...beta)
+
+
+## What's Changed
+### New to Path of Building
+- Add "aoe" filtering for gem search [\#1755](https://github.com/PathOfBuildingCommunity/PathOfBuilding-PoE2/pull/1755) ([github-actions](https://github.com/github-actions)[bot])
+- Add support for The Vertex "skill gems have no attribute requirement" [\#1736](https://github.com/PathOfBuildingCommunity/PathOfBuilding-PoE2/pull/1736) ([Blitz54](https://github.com/Blitz54))
+- Show Sanctified text on tooltip [\#1727](https://github.com/PathOfBuildingCommunity/PathOfBuilding-PoE2/pull/1727) ([Blitz54](https://github.com/Blitz54))
+- Add support for more reservation efficiency and non-minion skill pre … [\#1761](https://github.com/PathOfBuildingCommunity/PathOfBuilding-PoE2/pull/1761) ([ibabde](https://github.com/ibabde))
+- Adding DPS calculation for Firestorm, Rain of Arrows, Icestorm, Thunderstorm and Volcano [\#1747](https://github.com/PathOfBuildingCommunity/PathOfBuilding-PoE2/pull/1747) ([MrHB212](https://github.com/MrHB212))
+- Added support for the Decompose Poison Cloud [\#1750](https://github.com/PathOfBuildingCommunity/PathOfBuilding-PoE2/pull/1750) ([TarikBeentjes61](https://github.com/TarikBeentjes61))
+- Add progress bar to power report [\#1769](https://github.com/PathOfBuildingCommunity/PathOfBuilding-PoE2/pull/1769) ([github-actions](https://github.com/github-actions)[bot])
+### User Interface
+- Fix import and crafting text colour [\#1764](https://github.com/PathOfBuildingCommunity/PathOfBuilding-PoE2/pull/1764) ([Blitz54](https://github.com/Blitz54))
+### Fixed Calculations
+- Fix support gems importing as level other than 1 [\#1749](https://github.com/PathOfBuildingCommunity/PathOfBuilding-PoE2/pull/1749) ([Blitz54](https://github.com/Blitz54))
+- Fix Blasphemy rounding [\#1737](https://github.com/PathOfBuildingCommunity/PathOfBuilding-PoE2/pull/1737) ([Blitz54](https://github.com/Blitz54))
+### Fixed Behaviours
+- Fixed Rage Regeneration not applying the more damage granted from Rage [\#1751](https://github.com/PathOfBuildingCommunity/PathOfBuilding-PoE2/pull/1751) ([TarikBeentjes61](https://github.com/TarikBeentjes61))
+- Fix offhand unequip during node power process with Giant's Blood [\#1766](https://github.com/PathOfBuildingCommunity/PathOfBuilding-PoE2/pull/1766) ([LocalIdentity](https://github.com/LocalIdentity))
+- Fix Mace Strike import and "Two Hand" naming on items [\#1758](https://github.com/PathOfBuildingCommunity/PathOfBuilding-PoE2/pull/1758) ([Blitz54](https://github.com/Blitz54))
+- Fix low life defence mods not applying sometimes when using Starkonja's, Rise of the Pheonix and Coward Legacy [\#1704](https://github.com/PathOfBuildingCommunity/PathOfBuilding-PoE2/pull/1704) ([NamNgHH](https://github.com/NamNgHH))
+- [pob1-port] Set skillFlag from gem stat map [\#1767](https://github.com/PathOfBuildingCommunity/PathOfBuilding-PoE2/pull/1767) ([github-actions](https://github.com/github-actions)[bot])
+- Fix PoB Trader not prioritising local weapon mods [\#1779](https://github.com/PathOfBuildingCommunity/PathOfBuilding-PoE2/pull/1779) ([github-actions](https://github.com/github-actions)[bot])
+### Accuracy Improvements
+- Remove DNT weapon bases [\#1729](https://github.com/PathOfBuildingCommunity/PathOfBuilding-PoE2/pull/1729) ([Blitz54](https://github.com/Blitz54))
+### Other changes
+- Fix variant text ordering for The Adorned and Yoke of Suffering [\#1783](https://github.com/PathOfBuildingCommunity/PathOfBuilding-PoE2/pull/1783) ([poikende](https://github.com/poikende))
+
+
 ## [v0.15.0](https://github.com/PathOfBuildingCommunity/PathOfBuilding-PoE2/tree/v0.15.0) (2026/01/14)
 
 [Full Changelog](https://github.com/PathOfBuildingCommunity/PathOfBuilding-PoE2/compare/v0.14.0...v0.15.0)
