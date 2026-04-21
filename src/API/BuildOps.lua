@@ -1187,4 +1187,183 @@ function M.add_items_batch(params)
   return { results = results, successCount = successCount }
 end
 
+-- ============================================================================
+-- calc_with_jewel — calc tier, jewel edition
+-- ============================================================================
+--
+-- Equip a jewel in a tree socket, recompute, snapshot output, then restore.
+-- Unlike calc_with (override-based, non-persistent), calc_with_jewel actually
+-- mutates build state for the duration of the call — jewel radius effects
+-- require the real spec.allocNodes walk that GetMiscCalculator's override
+-- path skips.
+--
+-- PoB2 deltas from PoB1 that shape this handler:
+--
+--   * **No cluster jewels** (POB2-7). The PoE 1 implementation was ~500 LOC;
+--     ~300 of those were dedicated to cluster subgraphs (BuildClusterJewelGraphs,
+--     allocExtendedNodes / allocSubgraphNodes snapshots, subgraph BFS for
+--     auto-allocating notables inside the cluster, clusterSubgraph response
+--     shape, clusterJewelValid fix-up for multi-enchant bases). All of it is
+--     gone. If GGG ships a cluster-equivalent in PoE 2 later, re-introduce.
+--
+--   * **No minion army-DPS** postprocessing. Same reason as calc_with:
+--     minion tier not yet investigated.
+--
+--   * **Uses itemsTab:DeleteItem(item, true)** for cleanup — same method
+--     as PoB1 but we skip the manual `itemOrderList` iteration (DeleteItem
+--     does that internally at Classes/ItemsTab.lua:1448-1453).
+
+function M.calc_with_jewel(params)
+  if not build or not build.spec      then return nil, 'build/spec not initialized' end
+  if not build.itemsTab               then return nil, 'items not initialized' end
+  if not build.calcsTab               then return nil, 'calcs not initialized' end
+  if type(params) ~= 'table'          then return nil, 'invalid params' end
+
+  local nodeId = tonumber(params.socketNodeId)
+  if not nodeId then return nil, 'missing or invalid socketNodeId' end
+
+  local jewelText = params.jewelText
+  if type(jewelText) ~= 'string' or #jewelText == 0 then
+    return nil, 'missing or empty jewelText'
+  end
+  if #jewelText > MAX_ITEM_TEXT_LENGTH then
+    return nil, string.format('jewelText too long (max %d bytes)', MAX_ITEM_TEXT_LENGTH)
+  end
+
+  local spec = build.spec
+  local itemsTab = build.itemsTab
+  local socketCtrl = itemsTab.sockets and itemsTab.sockets[nodeId]
+  if not socketCtrl then
+    return nil, 'nodeId ' .. tostring(nodeId) .. ' is not a jewel socket'
+  end
+
+  -- 1. Baseline — make sure build is current before snapshotting.
+  M.get_main_output()
+  local beforeOutput = deepCopySafe(build.calcsTab.mainOutput)
+
+  -- 2. Snapshot restore targets.
+  local savedSocketSelId = socketCtrl.selItemId or 0
+
+  -- Nodes newly allocated during the test. Kept per-category so we can report
+  -- pointCost back to the caller and deallocate in the right order.
+  local addedPathIds    = {} -- socket + travel nodes from autoAllocateSocketPath
+  local addedExplicitIds = {} -- explicit allocateNodes
+  local createdItemId = nil
+
+  -- 3. Restore — runs on both success and failure paths.
+  local function restoreState()
+    pcall(function() socketCtrl:SetSelItemId(savedSocketSelId) end)
+
+    -- Deallocate everything we allocated. Order doesn't matter because we
+    -- track actual IDs rather than doing a diff.
+    for _, pid in ipairs(addedPathIds) do
+      local node = spec.nodes[pid]
+      if node then node.alloc = false end
+      spec.allocNodes[pid] = nil
+    end
+    for _, pid in ipairs(addedExplicitIds) do
+      local node = spec.nodes[pid]
+      if node then node.alloc = false end
+      spec.allocNodes[pid] = nil
+    end
+
+    if createdItemId and itemsTab.items[createdItemId] then
+      pcall(function() itemsTab:DeleteItem(itemsTab.items[createdItemId], true) end)
+    end
+
+    pcall(function()
+      itemsTab:PopulateSlots()
+      build.buildFlag = true
+      M.get_main_output()
+    end)
+  end
+
+  local ok, result = pcall(function()
+    -- 4a. If the socket isn't allocated, optionally path to it.
+    if not spec.allocNodes[nodeId] then
+      if params.autoAllocateSocketPath then
+        local pathResult, pathErr = M.find_path({ targetNodeId = nodeId })
+        if not pathResult then
+          error('failed to path to socket ' .. tostring(nodeId) .. ': ' .. tostring(pathErr))
+        end
+        for _, pn in ipairs(pathResult.path or {}) do
+          local pid = tonumber(pn.id)
+          if pid then
+            local node = spec.nodes[pid]
+            if node and not spec.allocNodes[pid] then
+              node.alloc = true
+              spec.allocNodes[pid] = node
+              table.insert(addedPathIds, pid)
+            end
+          end
+        end
+      end
+      -- Always allocate the socket itself when we got here.
+      local socketNode = spec.nodes[nodeId]
+      if socketNode and not spec.allocNodes[nodeId] then
+        socketNode.alloc = true
+        spec.allocNodes[nodeId] = socketNode
+        table.insert(addedPathIds, nodeId)
+      end
+    end
+
+    -- 4b. Parse + add the jewel item, then equip it.
+    local parseOk, item = pcall(new, 'Item', jewelText)
+    if not parseOk then error('invalid jewel text: ' .. tostring(item)) end
+    if not item or not item.baseName then error('failed to parse jewel item') end
+    if item.type ~= 'Jewel' then
+      error('item is not a jewel (type=' .. tostring(item.type) .. ')')
+    end
+
+    item:NormaliseQuality()
+    itemsTab:AddItem(item, true) -- noAutoEquip = true; we equip below
+    createdItemId = item.id
+    socketCtrl:SetSelItemId(createdItemId)
+
+    -- 4c. Explicit node allocation (non-cluster path — tests "jewel + these
+    -- notables allocated" as a single scenario).
+    if type(params.allocateNodes) == 'table' then
+      for _, rawId in ipairs(params.allocateNodes) do
+        local nid = tonumber(rawId)
+        if nid then
+          local node = spec.nodes[nid]
+          if node and not spec.allocNodes[nid] then
+            node.alloc = true
+            spec.allocNodes[nid] = node
+            table.insert(addedExplicitIds, nid)
+          end
+        end
+      end
+    end
+
+    -- 4d. Rebuild output with the jewel equipped.
+    itemsTab:PopulateSlots()
+    build.buildFlag = true
+    M.get_main_output()
+
+    local afterOutput = deepCopySafe(build.calcsTab.mainOutput)
+
+    local bDPS = (beforeOutput and beforeOutput.CombinedDPS) or 0
+    local aDPS = (afterOutput  and afterOutput.CombinedDPS)  or 0
+    local bLife = (beforeOutput and beforeOutput.Life) or 0
+    local aLife = (afterOutput  and afterOutput.Life)  or 0
+    io.stderr:write(string.format(
+      "[calc_with_jewel] CombinedDPS %.1f -> %.1f (delta=%.1f), Life %d -> %d\n",
+      bDPS, aDPS, aDPS - bDPS, bLife, aLife))
+
+    return {
+      beforeOutput        = beforeOutput,
+      afterOutput         = afterOutput,
+      allocatedPathNodes  = addedPathIds,
+      allocatedExtraNodes = addedExplicitIds,
+      pointCost           = #addedPathIds + #addedExplicitIds,
+    }
+  end)
+
+  restoreState()
+
+  if not ok then return nil, tostring(result) end
+  return result
+end
+
 return M

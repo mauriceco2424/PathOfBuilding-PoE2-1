@@ -306,6 +306,20 @@ handlers.add_items_batch = function(params)
   return { ok = true, results = res.results, successCount = res.successCount }
 end
 
+handlers.calc_with_jewel = function(params)
+  checkMemoryPressure()
+  local res, err = BuildOps.calc_with_jewel(params or {})
+  if not res then return { ok = false, error = err } end
+  return {
+    ok                   = true,
+    beforeOutput         = res.beforeOutput,
+    afterOutput          = res.afterOutput,
+    allocatedPathNodes   = res.allocatedPathNodes,
+    allocatedExtraNodes  = res.allocatedExtraNodes,
+    pointCost            = res.pointCost,
+  }
+end
+
 return {
   handlers     = handlers,
   version_meta = version_meta,
