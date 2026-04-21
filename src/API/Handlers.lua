@@ -306,6 +306,75 @@ handlers.add_items_batch = function(params)
   return { ok = true, results = res.results, successCount = res.successCount }
 end
 
+-- Skills tier ----------------------------------------------------------------
+
+handlers.get_skills = function(params)
+  local res, err = BuildOps.get_skills()
+  if not res then return { ok = false, error = err } end
+  return { ok = true, skills = res }
+end
+
+handlers.set_main_selection = function(params)
+  local ok2, err = BuildOps.set_main_selection(params or {})
+  if not ok2 then return { ok = false, error = err } end
+  return { ok = true }
+end
+
+handlers.create_socket_group = function(params)
+  local res, err = BuildOps.create_socket_group(params or {})
+  if not res then return { ok = false, error = err } end
+  return { ok = true, group = res }
+end
+
+handlers.add_gem = function(params)
+  checkMemoryPressure()
+  local res, err = BuildOps.add_gem(params or {})
+  if not res then return { ok = false, error = err } end
+  return { ok = true, gem = res }
+end
+
+handlers.remove_gem = function(params)
+  local ok2, err = BuildOps.remove_gem(params or {})
+  if not ok2 then return { ok = false, error = err } end
+  return { ok = true }
+end
+
+handlers.remove_skill = function(params)
+  local ok2, err = BuildOps.remove_skill(params or {})
+  if not ok2 then return { ok = false, error = err } end
+  return { ok = true }
+end
+
+handlers.set_gem_level = function(params)
+  local ok2, err = BuildOps.set_gem_level(params or {})
+  if not ok2 then return { ok = false, error = err } end
+  return { ok = true }
+end
+
+handlers.set_gem_quality = function(params)
+  local ok2, err = BuildOps.set_gem_quality(params or {})
+  if not ok2 then return { ok = false, error = err } end
+  return { ok = true }
+end
+
+handlers.set_gem_enabled = function(params)
+  local res, err = BuildOps.set_gem_enabled(params or {})
+  if not res then return { ok = false, error = err } end
+  return { ok = true, result = res }
+end
+
+handlers.calc_with_gems = function(params)
+  checkMemoryPressure()
+  local res, err = BuildOps.calc_with_gems(params or {})
+  if not res then return { ok = false, error = err } end
+  return {
+    ok         = true,
+    output     = res.output,
+    baseOutput = res.baseOutput,
+    warnings   = res.warnings,
+  }
+end
+
 handlers.calc_with_jewel = function(params)
   checkMemoryPressure()
   local res, err = BuildOps.calc_with_jewel(params or {})

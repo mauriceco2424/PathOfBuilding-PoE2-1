@@ -1188,6 +1188,704 @@ function M.add_items_batch(params)
 end
 
 -- ============================================================================
+-- Skills tier
+-- ============================================================================
+--
+-- PoB2 deltas from PoB1 that shape this tier:
+--
+--   * **No physical gem sockets on gear** (POB2-4). Skills live in a dedicated
+--     gem panel; support gems attach via UI, not links on gear. BUT — and this
+--     is the key finding from POB2-13 — PoB2 kept PoB1's
+--     `skillSets[n].socketGroupList[].gemList[]` data-model verbatim. Socket
+--     groups still exist, they just don't have a physical slot backing them.
+--     `socketGroup.slot` is now a UI-affinity string, not a mechanical link.
+--
+--   * **Support gem identity**: PoE 1's "gem name Support suffix mismatch"
+--     gotcha does NOT apply to PoB2. Support gems are named by their ability
+--     (e.g. "Fire Attunement", "Rapid Attacks I") — no "Support" suffix in
+--     `gemData.name`. `gemData.gemType == "Support"` is the canonical
+--     identifier; `gemData.grantedEffect.support == true` still works too.
+--     `gemData.tags.support == true` is ALSO set on every support gem.
+--
+--   * **Tag roster** (verified by greps over src/Data/Gems.lua):
+--       - Still present: aura, herald, warcry, totem, trap, mine, attack,
+--         spell, area, cold/fire/lightning/chaos, melee, movement, minion,
+--         duration, curse, slam, travel, strength/dex/int
+--       - NEW in PoE 2: grants_active_skill, shapeshift, bear, nova, payoff
+--       - Gone: guard (replaced by split dodge/deflect/block mechanics).
+--     Priority order for `skillType` classification drops `guard` and keeps
+--     everything else PoE 1 had.
+--
+--   * **New top-level gem fields** worth surfacing:
+--       - `gemType` — first-class "Attack" / "Spell" / "Support" category
+--       - `Tier` (int, 0-7 observed) — gem tier in PoE 2
+--       - `weaponRequirements` — comma-joined string like "One Hand Mace,
+--         Two Hand Mace"
+--       - `naturalMaxLevel` — gem's max level before +level scaling
+--       - `gemFamily` — groups support-gem upgrades (e.g. "Fire Attunement")
+--
+--   * **build.skillsTab.socketGroupList** is set to
+--     `skillSets[activeSkillSetId].socketGroupList` in SetActiveSkillSet
+--     (SkillsTab.lua:1308). We still go through the active skill set
+--     explicitly for safety — matches PoE 1 port's contract.
+--
+--   * **ProcessSocketGroup** is unchanged in spirit — resolves each gem's
+--     `gemData` from `data.gems[gemId]` (or via `data.gemsByGameId` for
+--     transfigured variants), then walks the granted effect to populate
+--     color / level / requirements. Must be called after any gemList mutation.
+
+-- Default level for a gem when the caller doesn't supply one. PoE 2 gems have
+-- a `Tier` system and `naturalMaxLevel` per gem — fall back to
+-- naturalMaxLevel when known, otherwise 20 (skill-gem cap).
+local function defaultGemLevel(gemData)
+  if gemData and gemData.naturalMaxLevel then return gemData.naturalMaxLevel end
+  return 20
+end
+
+-- Tag priority for primary skillType classification. PoE 2 dropped `guard`
+-- (replaced by distinct dodge/deflect/block). Order must stay stable so
+-- callers can rely on e.g. minion gems classifying as 'minion' even when
+-- they also have `attack` set.
+local SKILL_TYPE_PRIORITY = {
+  "aura", "herald", "warcry", "movement", "minion",
+  "totem", "trap", "mine", "attack", "spell",
+}
+
+local function classifySkillType(tags)
+  if type(tags) ~= 'table' then return nil end
+  for _, t in ipairs(SKILL_TYPE_PRIORITY) do
+    if tags[t] then return t end
+  end
+  return nil
+end
+
+-- Resolve a gem-panel lookup by nameSpec, gemId, skillId (= grantedEffectId),
+-- or gameId. Returns the gemData entry from `data.gems` or nil.
+--
+-- Matching order tries display name + gemFamily first (what ladder data and
+-- LLM tool calls usually carry), then falls back to canonical IDs. Unlike
+-- PoE 1, the " Support" suffix swap is not needed — PoB2 support gems
+-- identify themselves via gemType/tags, and their `.name` field has no
+-- "Support" suffix. We still try the swap for PoE-1-legacy ladder strings
+-- that carry "Increased Duration Support" etc. — cheap, and robust to any
+-- future PoE 2 migration that revives the suffix.
+local function findGemByIdentifier(identifier)
+  if not build or not build.data or not build.data.gems then return nil end
+  if not identifier then return nil end
+  local term = tostring(identifier)
+  local altTerm
+  if term:sub(-8) == " Support" then
+    altTerm = term:sub(1, -9)
+  else
+    altTerm = term .. " Support"
+  end
+  for _, gemData in pairs(build.data.gems) do
+    if gemData.name == term       or gemData.nameSpec == term
+       or gemData.name == altTerm or gemData.nameSpec == altTerm
+       or gemData.id == term      or gemData.gameId == term
+       or gemData.variantId == term then
+      return gemData
+    end
+    if gemData.grantedEffectId == term then return gemData end
+    if gemData.grantedEffect and gemData.grantedEffect.id == term then return gemData end
+  end
+  return nil
+end
+
+-- Always mutate through the active skill set. Returns (skillSet, err).
+local function activeSkillSet()
+  if not build or not build.skillsTab then return nil, 'skills not initialized' end
+  local id = build.skillsTab.activeSkillSetId or 1
+  local set = build.skillsTab.skillSets and build.skillsTab.skillSets[id]
+  if not set then return nil, 'active skill set not found' end
+  return set
+end
+
+-- Enumerate the current build's skill gem panel. Uses the active skill set
+-- (build.skillsTab.skillSets[activeSkillSetId].socketGroupList). Drops
+-- PoB1's socket-color / socket-group-count serialization — PoE 2 gem panel
+-- has neither concept.
+function M.get_skills()
+  if not build or not build.skillsTab or not build.calcsTab then
+    return nil, 'skills not initialized'
+  end
+  local skillSet, err = activeSkillSet()
+  if not skillSet then return nil, err end
+  local socketGroupList = skillSet.socketGroupList or build.skillsTab.socketGroupList or {}
+
+  local groups = {}
+  for idx, g in ipairs(socketGroupList) do
+    local names = {}
+    if g.displaySkillList then
+      for _, eff in ipairs(g.displaySkillList) do
+        if eff and eff.activeEffect and eff.activeEffect.grantedEffect then
+          table.insert(names, eff.activeEffect.grantedEffect.name)
+        end
+      end
+    end
+
+    local gemList = {}
+    if g.gemList then
+      for gemIdx, gem in ipairs(g.gemList) do
+        if gem then
+          -- Support-gem detection: PoB2 marks them three ways — surface any
+          -- of them being true as isSupport.
+          local isSupport = false
+          if gem.gemData then
+            if gem.gemData.gemType == "Support" then isSupport = true
+            elseif gem.gemData.tags and gem.gemData.tags.support then isSupport = true
+            elseif gem.gemData.grantedEffect and gem.gemData.grantedEffect.support then isSupport = true
+            end
+          end
+
+          local gemTags = {}
+          local skillType
+          local tagString
+          local gemType
+          local weaponRequirements
+          local gemFamily
+          local tier
+          local naturalMaxLevel
+          if gem.gemData then
+            local tags = gem.gemData.tags or {}
+            tagString          = gem.gemData.tagString
+            gemType            = gem.gemData.gemType
+            weaponRequirements = gem.gemData.weaponRequirements
+            gemFamily          = gem.gemData.gemFamily
+            tier               = gem.gemData.Tier
+            naturalMaxLevel    = gem.gemData.naturalMaxLevel
+            for k, v in pairs(tags) do
+              if v == true then gemTags[k] = true end
+            end
+            skillType = classifySkillType(tags)
+          end
+
+          table.insert(gemList, {
+            index              = gemIdx,
+            nameSpec           = gem.nameSpec,
+            gemId              = gem.gemId,
+            skillId            = gem.skillId,
+            variantId          = gem.variantId,
+            level              = gem.level,
+            quality            = gem.quality,
+            qualityId          = gem.qualityId,
+            enabled            = gem.enabled ~= false,
+            enableGlobal1      = gem.enableGlobal1,
+            enableGlobal2      = gem.enableGlobal2,
+            count              = gem.count,
+            isSupport          = isSupport,
+            skillType          = skillType,
+            gemType            = gemType,            -- PoB2 NEW
+            tier               = tier,               -- PoB2 NEW
+            naturalMaxLevel    = naturalMaxLevel,    -- PoB2 NEW
+            weaponRequirements = weaponRequirements, -- PoB2 NEW
+            gemFamily          = gemFamily,          -- PoB2 NEW (support-gem grouping)
+            tags               = gemTags,
+            tagString          = tagString,
+            reqStr             = gem.reqStr and gem.reqStr > 0 and gem.reqStr or nil,
+            reqDex             = gem.reqDex and gem.reqDex > 0 and gem.reqDex or nil,
+            reqInt             = gem.reqInt and gem.reqInt > 0 and gem.reqInt or nil,
+            reqLevel           = gem.reqLevel,
+            skillPart          = gem.skillPart,
+            skillMinion        = gem.skillMinion,
+            skillMinionSkill   = gem.skillMinionSkill,
+          })
+        end
+      end
+    end
+
+    table.insert(groups, {
+      index            = idx,
+      label            = g.label,
+      slot             = g.slot,      -- UI-affinity in PoB2, not a real socket
+      source           = g.source,
+      enabled          = g.enabled,
+      includeInFullDPS = g.includeInFullDPS,
+      groupCount       = g.groupCount,
+      mainActiveSkill  = g.mainActiveSkill,
+      skills           = names,
+      gemList          = gemList,
+    })
+  end
+
+  return {
+    mainSocketGroup  = build.mainSocketGroup,
+    activeSkillSetId = build.skillsTab.activeSkillSetId,
+    calcsSkillNumber = build.calcsTab.input and build.calcsTab.input.skill_number or nil,
+    groups           = groups,
+  }
+end
+
+-- set_main_selection: pick the main socket group / main active skill / skill
+-- part. `skillPart` mutates the source gem instance's `skillPart` field
+-- (used by multi-part skills like vaal variants).
+function M.set_main_selection(params)
+  if not build or not build.skillsTab or not build.calcsTab then
+    return nil, 'skills not initialized'
+  end
+  if type(params) ~= 'table' then return nil, 'invalid params' end
+
+  if params.mainSocketGroup ~= nil then
+    build.mainSocketGroup = tonumber(params.mainSocketGroup) or build.mainSocketGroup
+  end
+  local set, err = activeSkillSet()
+  if not set then return nil, err end
+  local groupList = set.socketGroupList or build.skillsTab.socketGroupList or {}
+  local g = groupList[build.mainSocketGroup]
+  if not g then return nil, 'invalid mainSocketGroup' end
+
+  if params.mainActiveSkill ~= nil then
+    g.mainActiveSkill = tonumber(params.mainActiveSkill) or g.mainActiveSkill
+  end
+  if params.skillPart ~= nil then
+    local idx = g.mainActiveSkill or 1
+    local src = g.displaySkillList and g.displaySkillList[idx]
+                and g.displaySkillList[idx].activeEffect
+                and g.displaySkillList[idx].activeEffect.srcInstance
+    if src then src.skillPart = tonumber(params.skillPart) end
+  end
+
+  if build.calcsTab.input then
+    build.calcsTab.input.skill_number = build.mainSocketGroup
+  end
+  M.get_main_output()
+  return true
+end
+
+-- Internal: resolve + push gem identity onto an instance.
+local function _assignGemIdentity(inst, gemData)
+  if not gemData then return end
+  inst.gemData  = gemData
+  inst.gemId    = gemData.id
+  inst.nameSpec = gemData.name or inst.nameSpec
+  inst.skillId  = (gemData.grantedEffect and gemData.grantedEffect.id) or gemData.grantedEffectId
+  if gemData.variantId then inst.variantId = gemData.variantId end
+end
+
+-- create_socket_group: create an empty socket group in the active skill set.
+-- A fresh PoB2 new_build has ZERO socket groups (PoB1 seeded one — PoB2's
+-- NewSkillSet doesn't). Callers need to seed a group before any add_gem
+-- call. The data shape matches PoB2's Load path (SkillsTab.lua:272-281).
+function M.create_socket_group(params)
+  if not build or not build.skillsTab then return nil, 'skills not initialized' end
+  if type(params) ~= 'table' then params = {} end
+
+  local skillSet, err = activeSkillSet()
+  if not skillSet then return nil, err end
+
+  local socketGroup = {
+    label                 = params.label or '',
+    slot                  = params.slot,
+    source                = nil,
+    enabled               = params.enabled ~= false,
+    includeInFullDPS      = params.includeInFullDPS == true,
+    groupCount            = tonumber(params.groupCount) or 1,
+    mainActiveSkill       = 1,
+    mainActiveSkillCalcs  = 1,
+    gemList               = {},
+  }
+
+  skillSet.socketGroupList = skillSet.socketGroupList or {}
+  table.insert(skillSet.socketGroupList, socketGroup)
+  local index = #skillSet.socketGroupList
+
+  if build.skillsTab.ProcessSocketGroup then
+    build.skillsTab:ProcessSocketGroup(socketGroup)
+  end
+  build.buildFlag = true
+  M.get_main_output()
+  return { index = index, label = socketGroup.label }
+end
+
+-- add_gem: append a gem to an existing socket group. PoE 2 accepts a name
+-- ("Fire Attunement"), a gemId ("Metadata/Items/Gems/..."), a skillId
+-- ("SupportAddedFireDamagePlayer"), or a variantId ("AddedFireDamageSupport")
+-- — all routed through findGemByIdentifier.
+function M.add_gem(params)
+  if not build or not build.skillsTab then return nil, 'skills not initialized' end
+  if type(params) ~= 'table' then return nil, 'invalid params' end
+  if params.groupIndex == nil or not params.gemName then
+    return nil, 'missing groupIndex or gemName'
+  end
+
+  local skillSet, err = activeSkillSet()
+  if not skillSet then return nil, err end
+  local groupIndex = tonumber(params.groupIndex)
+  local socketGroup = skillSet.socketGroupList[groupIndex]
+  if not socketGroup then
+    return nil, 'socket group not found at index ' .. tostring(groupIndex)
+  end
+
+  local gemData = findGemByIdentifier(params.gemName)
+  if not gemData then
+    return nil, "gem '" .. tostring(params.gemName) .. "' not found in gem database"
+  end
+
+  local inst = {
+    nameSpec      = gemData.name,
+    level         = tonumber(params.level)   or defaultGemLevel(gemData),
+    quality       = tonumber(params.quality) or 0,
+    qualityId     = params.qualityId or 'Default',
+    enabled       = params.enabled ~= false,
+    enableGlobal1 = true,
+    enableGlobal2 = true,
+    count         = tonumber(params.count) or 1,
+  }
+  _assignGemIdentity(inst, gemData)
+
+  socketGroup.gemList = socketGroup.gemList or {}
+  table.insert(socketGroup.gemList, inst)
+  local gemIndex = #socketGroup.gemList
+
+  if build.skillsTab.ProcessSocketGroup then
+    build.skillsTab:ProcessSocketGroup(socketGroup)
+  end
+  build.buildFlag = true
+  M.get_main_output()
+
+  return {
+    groupIndex = groupIndex,
+    gemIndex   = gemIndex,
+    name       = inst.nameSpec,
+    gemId      = inst.gemId,
+    skillId    = inst.skillId,
+  }
+end
+
+-- remove_gem: drop a gem by index. Socket group is reprocessed so downstream
+-- calcs drop the removed gem's granted effects.
+function M.remove_gem(params)
+  if not build or not build.skillsTab then return nil, 'skills not initialized' end
+  if type(params) ~= 'table' then return nil, 'invalid params' end
+  if params.groupIndex == nil or params.gemIndex == nil then
+    return nil, 'missing groupIndex or gemIndex'
+  end
+
+  local skillSet, err = activeSkillSet()
+  if not skillSet then return nil, err end
+  local socketGroup = skillSet.socketGroupList[tonumber(params.groupIndex)]
+  if not socketGroup or not socketGroup.gemList then return nil, 'socket group not found' end
+
+  local gemIndex = tonumber(params.gemIndex)
+  local gem = socketGroup.gemList[gemIndex]
+  if not gem then return nil, 'gem not found at index ' .. tostring(gemIndex) end
+
+  table.remove(socketGroup.gemList, gemIndex)
+
+  if build.skillsTab.ProcessSocketGroup then
+    build.skillsTab:ProcessSocketGroup(socketGroup)
+  end
+  build.buildFlag = true
+  M.get_main_output()
+  return true
+end
+
+-- remove_skill: drop an entire socket group. Source-backed groups
+-- (`socketGroup.source` — item-granted / node-granted skills) cannot be
+-- removed through the API; the game data owns them.
+function M.remove_skill(params)
+  if not build or not build.skillsTab then return nil, 'skills not initialized' end
+  if type(params) ~= 'table' then return nil, 'invalid params' end
+  if params.groupIndex == nil then return nil, 'missing groupIndex' end
+
+  local skillSet, err = activeSkillSet()
+  if not skillSet then return nil, err end
+  local groupIndex = tonumber(params.groupIndex)
+  local socketGroup = skillSet.socketGroupList[groupIndex]
+  if not socketGroup then return nil, 'socket group not found' end
+  if socketGroup.source then
+    return nil, 'cannot remove source-backed socket groups (item/node granted skills)'
+  end
+
+  table.remove(skillSet.socketGroupList, groupIndex)
+  build.buildFlag = true
+  M.get_main_output()
+  return true
+end
+
+-- set_gem_level: clamp to 1-40 (highest seen in PoE 2 data is naturalMaxLevel
+-- + awakened levels, capped at 40 for defensive input).
+function M.set_gem_level(params)
+  if not build or not build.skillsTab then return nil, 'skills not initialized' end
+  if type(params) ~= 'table' then return nil, 'invalid params' end
+  if params.groupIndex == nil or params.gemIndex == nil or params.level == nil then
+    return nil, 'missing groupIndex, gemIndex, or level'
+  end
+
+  local skillSet, err = activeSkillSet()
+  if not skillSet then return nil, err end
+  local socketGroup = skillSet.socketGroupList[tonumber(params.groupIndex)]
+  if not socketGroup then return nil, 'socket group not found' end
+  local gem = socketGroup.gemList and socketGroup.gemList[tonumber(params.gemIndex)]
+  if not gem then return nil, 'gem not found' end
+
+  local level = tonumber(params.level)
+  if not level or level < 1 or level > 40 then
+    return nil, 'invalid level (must be 1-40)'
+  end
+  gem.level = level
+
+  if build.skillsTab.ProcessSocketGroup then
+    build.skillsTab:ProcessSocketGroup(socketGroup)
+  end
+  build.buildFlag = true
+  M.get_main_output()
+  return true
+end
+
+-- set_gem_quality: PoB2 keeps the 0-23 quality range + alternate-quality
+-- variants (Default/Anomalous/Divergent/Phantasmal).
+function M.set_gem_quality(params)
+  if not build or not build.skillsTab then return nil, 'skills not initialized' end
+  if type(params) ~= 'table' then return nil, 'invalid params' end
+  if params.groupIndex == nil or params.gemIndex == nil or params.quality == nil then
+    return nil, 'missing groupIndex, gemIndex, or quality'
+  end
+
+  local skillSet, err = activeSkillSet()
+  if not skillSet then return nil, err end
+  local socketGroup = skillSet.socketGroupList[tonumber(params.groupIndex)]
+  if not socketGroup then return nil, 'socket group not found' end
+  local gem = socketGroup.gemList and socketGroup.gemList[tonumber(params.gemIndex)]
+  if not gem then return nil, 'gem not found' end
+
+  local quality = tonumber(params.quality)
+  if not quality or quality < 0 or quality > 23 then
+    return nil, 'invalid quality (must be 0-23)'
+  end
+  gem.quality = quality
+  if params.qualityId then gem.qualityId = tostring(params.qualityId) end
+
+  if build.skillsTab.ProcessSocketGroup then
+    build.skillsTab:ProcessSocketGroup(socketGroup)
+  end
+  build.buildFlag = true
+  M.get_main_output()
+  return true
+end
+
+-- set_gem_enabled: toggle per-gem enable state. Used to compare with/without
+-- a support gem's contribution without deleting it.
+function M.set_gem_enabled(params)
+  if not build or not build.skillsTab then return nil, 'skills not initialized' end
+  if type(params) ~= 'table' then return nil, 'invalid params' end
+  if params.groupIndex == nil or params.gemIndex == nil or params.enabled == nil then
+    return nil, 'missing groupIndex, gemIndex, or enabled'
+  end
+
+  local skillSet, err = activeSkillSet()
+  if not skillSet then return nil, err end
+  local socketGroup = skillSet.socketGroupList[tonumber(params.groupIndex)]
+  if not socketGroup then return nil, 'socket group not found' end
+  local gem = socketGroup.gemList and socketGroup.gemList[tonumber(params.gemIndex)]
+  if not gem then return nil, 'gem not found' end
+
+  gem.enabled = params.enabled == true
+  if build.skillsTab.ProcessSocketGroup then
+    build.skillsTab:ProcessSocketGroup(socketGroup)
+  end
+  build.buildFlag = true
+  M.get_main_output()
+  return {
+    groupIndex = tonumber(params.groupIndex),
+    gemIndex   = tonumber(params.gemIndex),
+    gemName    = gem.nameSpec,
+    enabled    = gem.enabled,
+  }
+end
+
+-- ============================================================================
+-- calc_with_gems — calc tier, gem edition
+-- ============================================================================
+--
+-- Snapshot every gemList in the active skill set, apply mutations, rebuild
+-- output, snapshot result, then restore. Unlike calc_with (which threads
+-- changes through a calc override), gem mutations require the full
+-- ProcessSocketGroup → BuildOutput pipeline — they don't go through
+-- GetMiscCalculator's addNodes/removeNodes/conditions override path.
+--
+-- Supported params:
+--   addGems      : [{ groupIndex, gem = { skillId, level?, quality?, qualityId? }}]
+--   replaceGems  : [{ groupIndex, gemIndex, gem = { skillId, level?, quality?, qualityId? }}]
+--   conditions   : string[]   — threaded through calcFunc override on both passes
+--   useFullDPS   : boolean    — default unset (inherits PoB2's FullDPS toggle)
+--
+-- Removals are deliberately out of scope: they break gemIndex-based restore.
+-- If a caller needs to measure "without gem X" use set_gem_enabled=false.
+
+function M.calc_with_gems(params)
+  if not build or not build.skillsTab or not build.calcsTab then
+    return nil, 'build not initialized'
+  end
+
+  local skillSet, err = activeSkillSet()
+  if not skillSet then return nil, err end
+  local socketGroupList = skillSet.socketGroupList or {}
+
+  -- 1. Snapshot gem state. DO NOT deepCopySafe — that strips gemData
+  --    (userdata-like table with metatable back-refs). Preserve references.
+  local originalState = {}
+  for groupIdx, group in ipairs(socketGroupList) do
+    if group.gemList then
+      originalState[groupIdx] = { _originalLength = #group.gemList }
+      for gemIdx, gem in ipairs(group.gemList) do
+        originalState[groupIdx][gemIdx] = {
+          nameSpec      = gem.nameSpec,
+          gemId         = gem.gemId,
+          skillId       = gem.skillId,
+          variantId     = gem.variantId,
+          gemData       = gem.gemData,
+          level         = gem.level,
+          quality       = gem.quality,
+          qualityId     = gem.qualityId,
+          enabled       = gem.enabled,
+          enableGlobal1 = gem.enableGlobal1,
+          enableGlobal2 = gem.enableGlobal2,
+          count         = gem.count,
+        }
+      end
+    end
+  end
+
+  -- 2. Baseline BEFORE any mutations.
+  local baseCalcFunc, baseOut = build.calcsTab:GetMiscCalculator()
+  if type(baseCalcFunc) ~= 'function' then
+    return nil, 'calculator not initialized (call BuildOutput first?)'
+  end
+  local condOverride = {}
+  if params and type(params.conditions) == 'table' then
+    condOverride.conditions = params.conditions
+  end
+  baseOut = baseCalcFunc(condOverride, params and params.useFullDPS)
+
+  -- 3. Apply mutations.
+  local modified = false
+  local warnings = {}
+
+  if params and type(params.replaceGems) == 'table' then
+    for _, replace in ipairs(params.replaceGems) do
+      local group = socketGroupList[tonumber(replace.groupIndex)]
+      if not group or not group.gemList then
+        table.insert(warnings, 'replaceGem: group ' .. tostring(replace.groupIndex) .. ' missing')
+      elseif not group.gemList[tonumber(replace.gemIndex)] then
+        table.insert(warnings, 'replaceGem: gemIndex ' .. tostring(replace.gemIndex) .. ' missing in group ' .. tostring(replace.groupIndex))
+      elseif not replace.gem then
+        table.insert(warnings, 'replaceGem: no gem spec')
+      else
+        local ident = replace.gem.skillId or replace.gem.gemId or replace.gem.name or replace.gem.gemName
+        local gemData = findGemByIdentifier(ident)
+        if not gemData then
+          table.insert(warnings, "replaceGem: '" .. tostring(ident) .. "' not in gem database")
+        else
+          local gem = group.gemList[tonumber(replace.gemIndex)]
+          _assignGemIdentity(gem, gemData)
+          gem.level     = replace.gem.level     or defaultGemLevel(gemData)
+          gem.quality   = replace.gem.quality   or 0
+          gem.qualityId = replace.gem.qualityId or 'Default'
+          modified = true
+        end
+      end
+    end
+  end
+
+  if params and type(params.addGems) == 'table' then
+    for _, add in ipairs(params.addGems) do
+      local group = socketGroupList[tonumber(add.groupIndex)]
+      if not group then
+        table.insert(warnings, 'addGem: group ' .. tostring(add.groupIndex) .. ' missing')
+      elseif not add.gem then
+        table.insert(warnings, 'addGem: no gem spec')
+      else
+        local ident = add.gem.skillId or add.gem.gemId or add.gem.name or add.gem.gemName
+        local gemData = findGemByIdentifier(ident)
+        if not gemData then
+          table.insert(warnings, "addGem: '" .. tostring(ident) .. "' not in gem database")
+        else
+          group.gemList = group.gemList or {}
+          local inst = {
+            level         = add.gem.level     or defaultGemLevel(gemData),
+            quality       = add.gem.quality   or 0,
+            qualityId     = add.gem.qualityId or 'Default',
+            enabled       = true,
+            enableGlobal1 = true,
+            enableGlobal2 = true,
+            count         = 1,
+          }
+          _assignGemIdentity(inst, gemData)
+          table.insert(group.gemList, inst)
+          modified = true
+        end
+      end
+    end
+  end
+
+  -- 4. Recompute if anything changed.
+  local out
+  if modified then
+    for _, group in ipairs(socketGroupList) do
+      if build.skillsTab.ProcessSocketGroup then
+        build.skillsTab:ProcessSocketGroup(group)
+      end
+    end
+    build.calcsTab:BuildOutput()
+    local modCalcFunc = build.calcsTab:GetMiscCalculator()
+    out = modCalcFunc(condOverride, params and params.useFullDPS)
+  else
+    out = baseOut
+  end
+
+  -- 5. Restore gem state.
+  for groupIdx, groupState in pairs(originalState) do
+    local group = socketGroupList[groupIdx]
+    if group and group.gemList then
+      for gemIdx, gemState in pairs(groupState) do
+        if type(gemIdx) == 'number' then
+          local gem = group.gemList[gemIdx]
+          if gem then
+            gem.nameSpec      = gemState.nameSpec
+            gem.gemId         = gemState.gemId
+            gem.skillId       = gemState.skillId
+            gem.variantId     = gemState.variantId
+            gem.gemData       = gemState.gemData
+            gem.level         = gemState.level
+            gem.quality       = gemState.quality
+            gem.qualityId     = gemState.qualityId
+            gem.enabled       = gemState.enabled
+            gem.enableGlobal1 = gemState.enableGlobal1
+            gem.enableGlobal2 = gemState.enableGlobal2
+            gem.count         = gemState.count
+          end
+        end
+      end
+      local origLen = groupState._originalLength or 0
+      while #group.gemList > origLen do table.remove(group.gemList) end
+    end
+  end
+
+  if modified then
+    for _, group in ipairs(socketGroupList) do
+      if build.skillsTab.ProcessSocketGroup then
+        build.skillsTab:ProcessSocketGroup(group)
+      end
+    end
+    build.calcsTab:BuildOutput()
+  end
+
+  local bDPS = (baseOut and baseOut.CombinedDPS) or 0
+  local aDPS = (out     and out.CombinedDPS)     or 0
+  io.stderr:write(string.format(
+    "[calc_with_gems] CombinedDPS %.1f -> %.1f (delta=%.1f)%s\n",
+    bDPS, aDPS, aDPS - bDPS,
+    (#warnings > 0) and (" | warnings=" .. #warnings) or ""))
+
+  return {
+    output     = deepCopySafe(out),
+    baseOutput = deepCopySafe(baseOut),
+    warnings   = warnings,
+  }
+end
+
+-- ============================================================================
 -- calc_with_jewel — calc tier, jewel edition
 -- ============================================================================
 --
