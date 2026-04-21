@@ -228,6 +228,48 @@ handlers.gc_collect = function(params)
   return { ok = true, memoryKB = memoryKB }
 end
 
+-- Tree tier ------------------------------------------------------------------
+
+handlers.get_tree = function(params)
+  local tree, err = BuildOps.get_tree()
+  if not tree then return { ok = false, error = err } end
+  return { ok = true, tree = tree }
+end
+
+handlers.set_tree = function(params)
+  checkMemoryPressure()
+  local ok2, err = BuildOps.set_tree(params or {})
+  if not ok2 then return { ok = false, error = err } end
+  local tree = BuildOps.get_tree()
+  return { ok = true, tree = tree }
+end
+
+handlers.update_tree_delta = function(params)
+  local ok2, err = BuildOps.update_tree_delta(params or {})
+  if not ok2 then return { ok = false, error = err } end
+  local tree = BuildOps.get_tree()
+  return { ok = true, tree = tree }
+end
+
+handlers.search_nodes = function(params)
+  local res, err = BuildOps.search_nodes(params or {})
+  if not res then return { ok = false, error = err or 'failed to search nodes' } end
+  return { ok = true, results = res }
+end
+
+handlers.find_path = function(params)
+  checkMemoryPressure()
+  local res, err = BuildOps.find_path(params or {})
+  if not res then return { ok = false, error = err or 'failed to find path' } end
+  return { ok = true, result = res }
+end
+
+handlers.get_nodes_in_radius = function(params)
+  local res, err = BuildOps.get_nodes_in_radius(params or {})
+  if not res then return { ok = false, error = err or 'failed to get nodes in radius' } end
+  return { ok = true, result = res }
+end
+
 return {
   handlers     = handlers,
   version_meta = version_meta,
