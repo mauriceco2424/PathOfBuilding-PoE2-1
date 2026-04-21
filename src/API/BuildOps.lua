@@ -19,6 +19,34 @@ local M = {}
 local MIN_PLAYER_LEVEL = 1
 local MAX_PLAYER_LEVEL = 100
 
+-- Strip functions / userdata / cycles / non-scalar keys so output tables survive
+-- the JSON encoder in Server.lua. Copied verbatim from PoE 1's BuildOps.lua —
+-- PoB2 has no equivalent utility in Common.lua.
+local function deepCopySafe(tbl, seen)
+  if type(tbl) ~= 'table' then
+    return tbl
+  end
+  seen = seen or {}
+  if seen[tbl] then
+    return nil
+  end
+  seen[tbl] = true
+  local out = {}
+  for k, v in pairs(tbl) do
+    local ktype = type(k)
+    if ktype == 'string' or ktype == 'number' or ktype == 'boolean' then
+      local vtype = type(v)
+      if vtype == 'table' then
+        local copied = deepCopySafe(v, seen)
+        if copied ~= nil then out[k] = copied end
+      elseif vtype ~= 'function' and vtype ~= 'userdata' and vtype ~= 'thread' then
+        out[k] = v
+      end
+    end
+  end
+  return out
+end
+
 -- Ensure outputs are (re)built and return the main output table safely.
 -- Idempotent: always wipes GlobalCache and forces a full BuildOutput pass so
 -- sequential API calls never read stale cache entries written by a prior pass
@@ -581,6 +609,173 @@ function M.get_nodes_in_radius(params)
     socketX    = socketNode.x,
     socketY    = socketNode.y,
     radii      = results,
+  }
+end
+
+-- ============================================================================
+-- Calc tier
+-- ============================================================================
+--
+-- PoB2 deltas from PoB1 for calc handlers:
+--
+--   * build.calcsTab:GetMiscCalculator() exists with the same signature
+--     (returns calcFunc, baseOutput). Verified in Modules/Calcs.lua:123 and
+--     Classes/CalcsTab.lua:693. The returned calcFunc(override, useFullDPS)
+--     still consumes override.addNodes / removeNodes / conditions — all keyed
+--     the same way as PoB1 (verified in Modules/CalcSetup.lua:687,704).
+--
+--   * override.masteryOverrides is NOT a PoB2 concept — grep shows zero hits
+--     under src/Modules/. Mastery selections are persisted on
+--     spec.masterySelections and must be mutated through set_tree /
+--     update_tree_delta rather than passed as a per-calc override.
+--
+--   * PoE 1's "mainSocketGroup DPS overlay" (falls back to best-DPS socket
+--     group when the currently-selected one is an aura / non-DPS skill) is
+--     intentionally NOT ported here. That logic reaches into activeSkillList
+--     and the socket-chain data model, which PoE 2 replaces with a flat gem
+--     panel. When the skills tier lands we'll revisit whether the same
+--     overlay concept applies — for now we trust build.mainSocketGroup and
+--     log a diagnostic if the base calculator returns 0 DPS.
+--
+--   * _computeArmyDps (minion army cap multiplication) is also not ported
+--     yet — same reason: minion data model + minionData.limit lookup needs
+--     verification against PoB2. Non-minion builds are unaffected; minion
+--     builds will show per-minion DPS only until minion tier lands.
+
+-- calc_with: run a what-if calculation with tree mutations applied to the
+-- otherwise-persistent build state. Returns both baseOutput (before) and
+-- output (after) so callers can diff stats without having to re-read baseline
+-- from a separate call.
+--
+-- Supported params:
+--   addNodes     : number[]   — node IDs to add to the allocation
+--   removeNodes  : number[]   — node IDs to remove from the allocation
+--   conditions   : string[]   — PoB condition flags to set for this calc
+--   useFullDPS   : boolean    — default true; pass false to skip FullDPS roll-up
+--
+-- Unlike set_tree/update_tree_delta, calc_with does NOT mutate build.spec —
+-- the override is threaded into calcs.initEnv and discarded after the calc.
+-- That means no restore pass is needed here (unlike calc_with_jewel where
+-- itemsTab mutations persist).
+function M.calc_with(params)
+  if not build or not build.calcsTab then return nil, 'build not initialized' end
+  if not build.calcsTab.GetMiscCalculator then
+    return nil, 'GetMiscCalculator unavailable'
+  end
+
+  -- Fetch the cached calculator. CalcsTab:BuildOutput already primes this.
+  local calcFunc, baseOut = build.calcsTab:GetMiscCalculator()
+  if type(calcFunc) ~= 'function' then
+    return nil, 'calculator not initialized (call build.calcsTab:BuildOutput first?)'
+  end
+
+  local diagnostics = {
+    addRequested     = 0,
+    addResolved      = 0,
+    addUnresolved    = {},
+    removeRequested  = 0,
+    removeResolved   = 0,
+    removeUnresolved = {},
+  }
+
+  local override = {}
+
+  if params and type(params.addNodes) == 'table' then
+    local addNodes = {}
+    local hasAny = false
+    diagnostics.addRequested = #params.addNodes
+    for _, id in ipairs(params.addNodes) do
+      local nid = tonumber(id)
+      local node = nid and build.spec and build.spec.nodes and build.spec.nodes[nid]
+      if node then
+        addNodes[node] = true
+        hasAny = true
+        diagnostics.addResolved = diagnostics.addResolved + 1
+      else
+        -- Fallback: a node already allocated (e.g. through a subgraph in a
+        -- future jewel system) may have a distinct object ref in allocNodes.
+        local allocNode = nid and build.spec and build.spec.allocNodes and build.spec.allocNodes[nid]
+        if allocNode then
+          addNodes[allocNode] = true
+          hasAny = true
+          diagnostics.addResolved = diagnostics.addResolved + 1
+        else
+          table.insert(diagnostics.addUnresolved, id)
+          io.stderr:write(string.format(
+            "[calc_with] WARN: addNode %s not in spec.nodes or allocNodes\n", tostring(id)))
+        end
+      end
+    end
+    if hasAny then override.addNodes = addNodes end
+  end
+
+  if params and type(params.removeNodes) == 'table' then
+    local removeNodes = {}
+    local hasAny = false
+    diagnostics.removeRequested = #params.removeNodes
+    for _, id in ipairs(params.removeNodes) do
+      local nid = tonumber(id)
+      local specNode = nid and build.spec and build.spec.nodes and build.spec.nodes[nid]
+      local allocNode = nid and build.spec and build.spec.allocNodes and build.spec.allocNodes[nid]
+      if allocNode then
+        removeNodes[allocNode] = true
+        hasAny = true
+        diagnostics.removeResolved = diagnostics.removeResolved + 1
+      elseif specNode then
+        -- Node exists but isn't allocated — no-op, but log.
+        io.stderr:write(string.format(
+          "[calc_with] WARN: removeNode %s exists in spec.nodes but is NOT allocated (no-op)\n",
+          tostring(id)))
+      else
+        table.insert(diagnostics.removeUnresolved, id)
+        io.stderr:write(string.format(
+          "[calc_with] WARN: removeNode %s not in spec.nodes or allocNodes\n", tostring(id)))
+      end
+    end
+    if hasAny then override.removeNodes = removeNodes end
+  end
+
+  if params and type(params.conditions) == 'table' then
+    override.conditions = params.conditions
+  end
+
+  local hasOverride = override.addNodes or override.removeNodes or override.conditions
+  if not hasOverride then
+    io.stderr:write(string.format(
+      "[calc_with] WARN: override resolved empty (add %d/%d, remove %d/%d) — before/after will match\n",
+      diagnostics.addResolved, diagnostics.addRequested,
+      diagnostics.removeResolved, diagnostics.removeRequested))
+  end
+
+  local useFullDPS = params and params.useFullDPS
+  if useFullDPS == nil then useFullDPS = true end
+
+  local ok, outOrErr = pcall(calcFunc, override, useFullDPS)
+  if not ok then
+    return nil, 'calc failed: ' .. tostring(outOrErr)
+  end
+  local out = outOrErr
+
+  -- Log a short diagnostic when a non-empty override produced no change —
+  -- typically a sign that the resolved node list wasn't valid or that the
+  -- override silently got filtered inside calcs.perform.
+  if hasOverride and diagnostics.addRequested + diagnostics.removeRequested > 0 then
+    local baseFullDPS  = (baseOut and baseOut.FullDPS)  or 0
+    local afterFullDPS = (out and out.FullDPS)  or 0
+    local baseTotalDPS = (baseOut and baseOut.TotalDPS) or 0
+    local afterTotalDPS = (out and out.TotalDPS) or 0
+    io.stderr:write(string.format(
+      "[calc_with] FullDPS %d->%d | TotalDPS %d->%d | Life %d->%d | EHP %d->%d\n",
+      baseFullDPS, afterFullDPS,
+      baseTotalDPS, afterTotalDPS,
+      (baseOut and baseOut.Life or 0), (out and out.Life or 0),
+      (baseOut and baseOut.TotalEHP or 0), (out and out.TotalEHP or 0)))
+  end
+
+  return {
+    output     = deepCopySafe(out),
+    baseOutput = deepCopySafe(baseOut),
+    diagnostics = diagnostics,
   }
 end
 

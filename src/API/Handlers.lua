@@ -270,6 +270,20 @@ handlers.get_nodes_in_radius = function(params)
   return { ok = true, result = res }
 end
 
+-- Calc tier ------------------------------------------------------------------
+
+handlers.calc_with = function(params)
+  checkMemoryPressure()
+  local res, err = BuildOps.calc_with(params or {})
+  if not res then return { ok = false, error = err } end
+  return {
+    ok          = true,
+    output      = res.output,
+    baseOutput  = res.baseOutput,
+    diagnostics = res.diagnostics,
+  }
+end
+
 return {
   handlers     = handlers,
   version_meta = version_meta,
