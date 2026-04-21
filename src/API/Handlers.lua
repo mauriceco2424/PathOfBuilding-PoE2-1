@@ -284,6 +284,28 @@ handlers.calc_with = function(params)
   }
 end
 
+-- Items tier -----------------------------------------------------------------
+
+handlers.get_items = function(params)
+  local list, err = BuildOps.get_items()
+  if not list then return { ok = false, error = err } end
+  return { ok = true, items = list }
+end
+
+handlers.add_item_text = function(params)
+  checkMemoryPressure()
+  local res, err = BuildOps.add_item_text(params or {})
+  if not res then return { ok = false, error = err } end
+  return { ok = true, item = res }
+end
+
+handlers.add_items_batch = function(params)
+  checkMemoryPressure()
+  local res, err = BuildOps.add_items_batch(params or {})
+  if not res then return { ok = false, error = err } end
+  return { ok = true, results = res.results, successCount = res.successCount }
+end
+
 return {
   handlers     = handlers,
   version_meta = version_meta,

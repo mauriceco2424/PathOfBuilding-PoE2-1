@@ -18,6 +18,7 @@ local M = {}
 
 local MIN_PLAYER_LEVEL = 1
 local MAX_PLAYER_LEVEL = 100
+local MAX_ITEM_TEXT_LENGTH = 16 * 1024 -- 16KB — matches PoE 1 cap; rare item text is ~1-2KB
 
 -- Strip functions / userdata / cycles / non-scalar keys so output tables survive
 -- the JSON encoder in Server.lua. Copied verbatim from PoE 1's BuildOps.lua —
@@ -777,6 +778,413 @@ function M.calc_with(params)
     baseOutput = deepCopySafe(baseOut),
     diagnostics = diagnostics,
   }
+end
+
+-- ============================================================================
+-- Items tier
+-- ============================================================================
+--
+-- PoB2 deltas from PoB1 that shape this tier:
+--
+--   * **Slot roster** (POB2-10): 20 base slots instead of PoE 1's 11.
+--     Weapons now include 1/2 Swap (weapon swap is first-class, POB2-6);
+--     rings are 3 not 2; flasks are 2 not 5; charms (3) are NEW; the four
+--     "Arm 1/2 + Leg 1/2" slots hold PoE 2's **Transcendent Limb** items
+--     (`src/Data/Bases/incursionlimb.lua` — implicit-bearing late-game
+--     items from the Incursion temple). See `baseSlots` in ItemsTab.lua.
+--
+--   * **No skill-gem sockets** (POB2-4). `it.sockets` still exists but now
+--     holds RUNE sockets (small stat bonuses), not linked gem slots. Rune
+--     mods are on `it.runeModLines`, the rune list on `it.runes`. PoE 1's
+--     socket color/group serialization is dropped.
+--
+--   * **No PoE 1 influence flags** (`shaperItem`, `elderItem`, `hunterItem`,
+--     `crusaderItem`, `redeemerItem`, `warlordItem`) — those mechanics don't
+--     exist in PoE 2. Likewise scourge/crucible/eater/exarch/veiled are gone.
+--
+--   * **New mod line buckets**: `runeModLines`, `classRequirementModLines`,
+--     `buffModLines` — surface them for callers that care.
+--
+--   * **Charms** (new slot type): `build.itemsTab.slots["Charm N"]` has the
+--     same `active` checkbox pattern as flasks (ItemSlotControl.lua:43-54).
+--     Our add_item_text/add_items_batch auto-activate path extends to Charm
+--     slots as well as Flask slots.
+
+-- Extract a mod line from it.implicitModLines / it.explicitModLines /
+-- it.enchantModLines / it.runeModLines / it.classRequirementModLines /
+-- it.buffModLines into a JSON-friendly entry. Skips mods with empty / nil
+-- `line` text (seen as "corrupted" entries on some imports).
+local function extractModLine(modLine)
+  if not modLine then return nil end
+  if not modLine.line or modLine.line == "" then return nil end
+  local entry = {
+    line    = modLine.line,
+    range   = modLine.range,
+    modTags = modLine.modTags or {},
+  }
+  -- Boolean flags we surface (PoE 2 set; no influence/scourge/etc.)
+  if modLine.crafted    then entry.crafted    = true end
+  if modLine.fractured  then entry.fractured  = true end
+  if modLine.implicit   then entry.implicit   = true end
+  if modLine.enchant    then entry.enchant    = true end
+  if modLine.rune       then entry.rune       = true end
+  if modLine.custom     then entry.custom     = true end
+  return entry
+end
+
+-- get_items: dump the equipped item set + all cached items by slot.
+-- Returns an array ordered by `itemsTab.orderedSlots` (the slot-panel order
+-- from ItemsTab.lua:30 — Weapon 1, Weapon 2, Helmet ... Arm 1, Arm 2, Leg 1,
+-- Leg 2, then jewel sockets appended in node-id order). Only slots with
+-- `selItemId > 0` are included. Jewels equipped in tree sockets are also
+-- enumerated from build.spec.jewels.
+function M.get_items()
+  if not build or not build.itemsTab then return nil, 'items not initialized' end
+  local itemsTab = build.itemsTab
+  local result = {}
+  local seen = {}
+  local addedItemIds = {}
+
+  local function append_item(slotName, itemId, activeSlotName)
+    if not itemId or itemId <= 0 or addedItemIds[itemId] then return nil end
+    local it = itemsTab.items[itemId]
+    if not it then return nil end
+
+    local entry = {
+      slot      = slotName,
+      id        = itemId,
+      name      = it.name,
+      baseName  = it.baseName,
+      type      = it.type,
+      subType   = it.base and it.base.subType or nil, -- NEW: Transcendent Arm / Leg
+      rarity    = it.rarity,
+      raw       = it.raw,
+      -- Item metadata
+      itemLevel = it.itemLevel,
+      quality   = it.quality,
+      -- Item flags (PoE 2 set — no influence flags, no scourge/veiled/synth)
+      corrupted = it.corrupted  or false,
+      mirrored  = it.mirrored   or false,
+      fractured = it.fractured  or false,
+      split     = it.split      or false,
+      -- Jewel radius metadata
+      jewelRadiusLabel = it.jewelRadiusLabel,
+      jewelRadiusIndex = it.jewelRadiusIndex,
+    }
+
+    -- Affix data (prefix/suffix mod IDs + value ranges)
+    entry.prefixes = {}
+    if it.prefixes then
+      for _, p in ipairs(it.prefixes) do
+        if p.modId and p.modId ~= "None" then
+          table.insert(entry.prefixes, { modId = p.modId, range = p.range })
+        end
+      end
+    end
+    entry.suffixes = {}
+    if it.suffixes then
+      for _, s in ipairs(it.suffixes) do
+        if s.modId and s.modId ~= "None" then
+          table.insert(entry.suffixes, { modId = s.modId, range = s.range })
+        end
+      end
+    end
+    entry.prefixCount = #entry.prefixes
+    entry.suffixCount = #entry.suffixes
+    if it.rarity == "RARE" or it.rarity == "MAGIC" then
+      entry.maxPrefixes = it.rarity == "MAGIC" and 1 or 3
+      entry.maxSuffixes = it.rarity == "MAGIC" and 1 or 3
+    end
+
+    -- Structured mod lines (PoE 2 buckets)
+    entry.implicitMods = {}
+    if it.implicitModLines then
+      for _, m in ipairs(it.implicitModLines) do
+        local e = extractModLine(m); if e then table.insert(entry.implicitMods, e) end
+      end
+    end
+    entry.explicitMods = {}
+    if it.explicitModLines then
+      for _, m in ipairs(it.explicitModLines) do
+        local e = extractModLine(m); if e then table.insert(entry.explicitMods, e) end
+      end
+    end
+    entry.enchantMods = {}
+    if it.enchantModLines then
+      for _, m in ipairs(it.enchantModLines) do
+        local e = extractModLine(m); if e then table.insert(entry.enchantMods, e) end
+      end
+    end
+    entry.runeMods = {}  -- NEW in PoE 2 — rune socket mods live here
+    if it.runeModLines then
+      for _, m in ipairs(it.runeModLines) do
+        local e = extractModLine(m); if e then table.insert(entry.runeMods, e) end
+      end
+    end
+    entry.classRequirementMods = {}
+    if it.classRequirementModLines then
+      for _, m in ipairs(it.classRequirementModLines) do
+        local e = extractModLine(m); if e then table.insert(entry.classRequirementMods, e) end
+      end
+    end
+
+    -- Runes (the raw rune list — distinct from runeModLines text)
+    if it.runes and #it.runes > 0 then
+      entry.runes = {}
+      for _, r in ipairs(it.runes) do table.insert(entry.runes, r) end
+    end
+
+    -- Catalyst (PoE 2 keeps the mechanic — see Item.lua:581-585 + ItemsTab.lua:32-44)
+    if it.catalyst then
+      local catalystNames = {"Abrasive","Accelerating","Fertile","Imbued","Intrinsic",
+                             "Noxious","Prismatic","Tempering","Turbulent","Unstable"}
+      entry.catalyst        = catalystNames[it.catalyst]
+      entry.catalystQuality = it.catalystQuality or 20
+    end
+
+    -- Requirements — use modified values when present (mirror PoB's
+    -- env.requirementsTableItems logic).
+    if it.requirements then
+      local strReq = it.requirements.strMod or it.requirements.str or 0
+      local dexReq = it.requirements.dexMod or it.requirements.dex or 0
+      local intReq = it.requirements.intMod or it.requirements.int or 0
+      entry.requirements = {
+        level = it.requirements.level,
+        str   = strReq > 0 and strReq or nil,
+        dex   = dexReq > 0 and dexReq or nil,
+        int   = intReq > 0 and intReq or nil,
+        runeLevel = (it.requirements.runeLevel or 0) > 0 and it.requirements.runeLevel or nil,
+      }
+    end
+
+    -- Defense (Armour / Evasion / Energy Shield — PoE 2 dropped Ward)
+    if it.armourData then
+      entry.armourData = {
+        armour       = it.armourData.Armour,
+        evasion      = it.armourData.Evasion,
+        energyShield = it.armourData.EnergyShield,
+      }
+    end
+
+    -- Weapon (per-hand nested table, same as PoB1 — see Item.lua:1549).
+    if it.weaponData then
+      local slotNum = (slotName and slotName:match("Weapon 2")) and 2 or 1
+      local wd = it.weaponData[slotNum]
+      if wd then
+        entry.weaponData = {
+          physicalMin  = wd.PhysicalMin,
+          physicalMax  = wd.PhysicalMax,
+          physicalDPS  = wd.PhysicalDPS,
+          elementalDPS = wd.ElementalDPS,
+          chaosDPS     = wd.ChaosDPS,
+          totalDPS     = wd.TotalDPS,
+          critChance   = wd.CritChance,
+          attackRate   = wd.AttackRate,
+          range        = wd.range,
+          fireMin      = wd.FireMin,      fireMax      = wd.FireMax,
+          coldMin      = wd.ColdMin,      coldMax      = wd.ColdMax,
+          lightningMin = wd.LightningMin, lightningMax = wd.LightningMax,
+          chaosMin     = wd.ChaosMin,     chaosMax     = wd.ChaosMax,
+        }
+      end
+    end
+
+    -- Flask (recovery + charge data). PoB2 adds a handful of Inc/Mod rate
+    -- fields; we surface what's stable.
+    if it.flaskData then
+      entry.flaskData = {
+        lifeTotal   = it.flaskData.lifeTotal,
+        lifeGradual = it.flaskData.lifeGradual,
+        lifeInstant = it.flaskData.lifeInstant,
+        manaTotal   = it.flaskData.manaTotal,
+        manaGradual = it.flaskData.manaGradual,
+        manaInstant = it.flaskData.manaInstant,
+        duration    = it.flaskData.duration,
+        chargesMax  = it.flaskData.chargesMax,
+        chargesUsed = it.flaskData.chargesUsed,
+        instantPerc = it.flaskData.instantPerc,
+      }
+    end
+
+    -- Charm (NEW in PoE 2). Structurally similar to flasks — duration +
+    -- charge economy, no recovery pool.
+    if it.charmData then
+      entry.charmData = {
+        duration    = it.charmData.duration,
+        chargesMax  = it.charmData.chargesMax,
+        chargesUsed = it.charmData.chargesUsed,
+        effectInc   = it.charmData.effectInc,
+      }
+    end
+
+    -- Activation flag (flasks + charms both honor activeItemSet[slot].active)
+    local set = itemsTab.activeItemSet
+    if activeSlotName and set and set[activeSlotName] and set[activeSlotName].active ~= nil then
+      entry.active = set[activeSlotName].active and true or false
+    end
+
+    table.insert(result, entry)
+    addedItemIds[itemId] = true
+    return entry
+  end
+
+  local function add_slot(slotName)
+    if seen[slotName] then return end
+    seen[slotName] = true
+    local slotCtrl = itemsTab.slots[slotName]
+    if not slotCtrl then return end
+    local selId = slotCtrl.selItemId or 0
+    if selId > 0 then
+      append_item(slotName, selId, slotName)
+    end
+  end
+
+  local ordered = itemsTab.orderedSlots or {}
+  for _, slot in ipairs(ordered) do
+    if slot and slot.slotName then add_slot(slot.slotName) end
+  end
+  -- Catch slots that aren't in orderedSlots (shouldn't happen but safe).
+  for slotName, _ in pairs(itemsTab.slots or {}) do add_slot(slotName) end
+
+  -- Tree-socket jewels (build.spec.jewels is node-id -> item-id).
+  local spec = build.spec or {}
+  if spec.jewels then
+    for nodeId, itemId in pairs(spec.jewels) do
+      local entry = append_item("Jewel " .. tostring(nodeId), itemId, nil)
+      if entry then
+        entry.socketNodeId = tonumber(nodeId) or nodeId
+      end
+    end
+  end
+
+  return result
+end
+
+-- Internal: activate flask/charm checkbox state when equipping via API.
+-- Flasks and charms in PoB2 both use the activeItemSet[slot].active flag +
+-- the ItemSlotControl.active cache (see ItemSlotControl.lua:31-54).
+local function _autoActivateFlaskOrCharm(itemsTab, slotName)
+  if not slotName then return end
+  local isFlask = slotName:match('^Flask %d$') ~= nil
+  local isCharm = slotName:match('^Charm %d$') ~= nil
+  if not (isFlask or isCharm) then return end
+  local set = itemsTab.activeItemSet
+  if set and set[slotName] then set[slotName].active = true end
+  local ctrl = itemsTab.slots[slotName]
+  if ctrl then
+    ctrl.active = true
+    if ctrl.controls and ctrl.controls.activate then
+      ctrl.controls.activate.state = true
+    end
+  end
+end
+
+-- add_item_text: parse one item from raw item text, add it to itemsTab.items,
+-- and optionally equip it in a slot.
+function M.add_item_text(params)
+  if not build or not build.itemsTab then return nil, 'items not initialized' end
+  if type(params) ~= 'table' or type(params.text) ~= 'string' then
+    return nil, 'missing text'
+  end
+  if #params.text == 0 then return nil, 'item text cannot be empty' end
+  if #params.text > MAX_ITEM_TEXT_LENGTH then
+    return nil, string.format('item text too long (max %d bytes)', MAX_ITEM_TEXT_LENGTH)
+  end
+
+  local ok, item = pcall(new, 'Item', params.text)
+  if not ok then return nil, 'invalid item text: ' .. tostring(item) end
+  if not item or not item.baseName then return nil, 'failed to parse item' end
+
+  item:NormaliseQuality()
+  build.itemsTab:AddItem(item, params.noAutoEquip == true)
+
+  if params.slotName then
+    local slot = tostring(params.slotName)
+    if build.itemsTab.slots[slot] then
+      build.itemsTab.slots[slot]:SetSelItemId(item.id)
+      _autoActivateFlaskOrCharm(build.itemsTab, slot)
+      build.itemsTab:PopulateSlots()
+    end
+  end
+
+  build.itemsTab:AddUndoState()
+  build.buildFlag = true
+  M.get_main_output()
+  return {
+    id   = item.id,
+    name = item.name,
+    slot = params.slotName or item:GetPrimarySlot(),
+  }
+end
+
+-- add_items_batch: parse + equip multiple items in one call. Defers the
+-- expensive PopulateSlots / AddUndoState / BuildOutput to the end so a
+-- 20-item import doesn't incur 20 full recalcs.
+function M.add_items_batch(params)
+  if not build or not build.itemsTab then return nil, 'items not initialized' end
+  if type(params) ~= 'table' or type(params.items) ~= 'table' then
+    return nil, 'missing items array'
+  end
+
+  local results = {}
+  local successCount = 0
+
+  for i, itemParams in ipairs(params.items) do
+    local result = { index = i }
+
+    if type(itemParams) ~= 'table' or type(itemParams.text) ~= 'string' then
+      result.ok = false; result.error = 'missing or invalid text'
+      table.insert(results, result); goto continue
+    end
+    if #itemParams.text == 0 then
+      result.ok = false; result.error = 'item text cannot be empty'
+      table.insert(results, result); goto continue
+    end
+    if #itemParams.text > MAX_ITEM_TEXT_LENGTH then
+      result.ok = false
+      result.error = string.format('item text too long (max %d bytes)', MAX_ITEM_TEXT_LENGTH)
+      table.insert(results, result); goto continue
+    end
+
+    local ok, item = pcall(new, 'Item', itemParams.text)
+    if not ok then
+      result.ok = false; result.error = 'invalid item text: ' .. tostring(item)
+      table.insert(results, result); goto continue
+    end
+    if not item or not item.baseName then
+      result.ok = false; result.error = 'failed to parse item'
+      table.insert(results, result); goto continue
+    end
+
+    item:NormaliseQuality()
+    build.itemsTab:AddItem(item, itemParams.noAutoEquip == true)
+
+    if itemParams.slotName then
+      local slot = tostring(itemParams.slotName)
+      if build.itemsTab.slots[slot] then
+        build.itemsTab.slots[slot]:SetSelItemId(item.id)
+        _autoActivateFlaskOrCharm(build.itemsTab, slot)
+      end
+    end
+
+    result.ok   = true
+    result.id   = item.id
+    result.name = item.name
+    result.slot = itemParams.slotName or item:GetPrimarySlot()
+    successCount = successCount + 1
+    table.insert(results, result)
+
+    ::continue::
+  end
+
+  if successCount > 0 then
+    build.itemsTab:PopulateSlots()
+    build.itemsTab:AddUndoState()
+    build.buildFlag = true
+    M.get_main_output()
+  end
+
+  return { results = results, successCount = successCount }
 end
 
 return M
