@@ -19,6 +19,10 @@ spec/test_results.log
 spec/test_generation.log
 src/luacov.stats.out
 
+# API smoke/roundtrip test outputs (regenerated every run)
+spec/*.log
+spec/*.jsonl
+
 # Release
 manifest-updated.xml
 
