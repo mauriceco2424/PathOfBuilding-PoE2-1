@@ -389,6 +389,27 @@ handlers.calc_with_jewel = function(params)
   }
 end
 
+-- Jewel tier -----------------------------------------------------------------
+
+handlers.get_jewel_sockets = function(params)
+  local list, err = BuildOps.get_jewel_sockets()
+  if not list then return { ok = false, error = err } end
+  return { ok = true, sockets = list }
+end
+
+handlers.set_jewel = function(params)
+  checkMemoryPressure()
+  local res, err = BuildOps.set_jewel(params or {})
+  if not res then return { ok = false, error = err } end
+  return { ok = true, result = res }
+end
+
+handlers.remove_jewel = function(params)
+  local res, err = BuildOps.remove_jewel(params or {})
+  if not res then return { ok = false, error = err } end
+  return { ok = true, result = res }
+end
+
 -- Config tier ----------------------------------------------------------------
 
 handlers.get_config = function(params)

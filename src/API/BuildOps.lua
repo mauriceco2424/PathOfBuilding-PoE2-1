@@ -2065,6 +2065,211 @@ function M.calc_with_jewel(params)
 end
 
 -- ============================================================================
+-- Jewel tier
+-- ============================================================================
+--
+-- PoB2 deltas from PoB1 that shape this tier:
+--
+--   * Cluster jewels don't exist (POB2-7). All cluster-specific machinery from
+--     PoE 1's jewel tier is dropped: _fixClusterJewelValid, BuildClusterJewelGraphs,
+--     autoAllocateNotables BFS into subgraphs, subgraph socket discovery,
+--     clusterSocketSize / acceptsClusterJewel / isSubgraphSocket metadata, and
+--     the set_cluster_chain handler entirely. `node.expansionJewel` still exists
+--     on the base tree for forward compat but doesn't produce subgraphs.
+--   * The socket / jewel infra (itemsTab.sockets[nodeId], spec.jewels[nodeId],
+--     socketCtrl:SetSelItemId, itemsTab:PopulateSlots) is unchanged from PoB1 —
+--     verified via calc_with_jewel which round-trips cleanly.
+--   * Socket auto-allocation uses the direct `spec.allocNodes[nodeId] = node`
+--     pattern proven out in calc_with_jewel — sidesteps POB2-9's 9-arg
+--     ImportFromNodeList ceremony for this narrow case.
+
+-- Enumerate jewel sockets on the current tree. Returns one entry per socket
+-- with allocation state and (if equipped) the jewel in it.
+function M.get_jewel_sockets()
+  if not build or not build.spec then return nil, 'build/spec not initialized' end
+  if not build.itemsTab         then return nil, 'items not initialized' end
+
+  local spec = build.spec
+  local itemsTab = build.itemsTab
+  local result = {}
+
+  -- itemsTab.sockets is keyed by nodeId. In PoB1 it can retain stale entries
+  -- from destroyed cluster subgraphs; in PoB2 that class of stale key doesn't
+  -- arise (no subgraphs), but we still gate on spec.nodes[nodeId] for safety.
+  for nodeId, socketCtrl in pairs(itemsTab.sockets) do
+    local node = spec.nodes[nodeId]
+    if node then
+      local equippedJewelId = spec.jewels[nodeId] or 0
+      local equippedJewel = nil
+      if equippedJewelId > 0 then
+        local item = itemsTab.items[equippedJewelId]
+        if item then
+          equippedJewel = {
+            id       = equippedJewelId,
+            name     = item.name,
+            baseName = item.baseName,
+            type     = item.type,
+            rarity   = item.rarity,
+            raw      = item.raw,
+          }
+        end
+      end
+
+      table.insert(result, {
+        nodeId          = nodeId,
+        slotName        = socketCtrl.slotName,
+        isAllocated     = spec.allocNodes[nodeId] ~= nil,
+        equippedJewelId = equippedJewelId,
+        equippedJewel   = equippedJewel,
+        x               = node.x,
+        y               = node.y,
+      })
+    end
+  end
+
+  table.sort(result, function(a, b) return a.nodeId < b.nodeId end)
+  return result
+end
+
+-- Equip a jewel into a tree socket. Persistent counterpart of calc_with_jewel.
+-- params: { nodeId: number, text: string } OR { nodeId: number, itemId: number },
+-- plus optional { autoAllocateSocketPath: bool } to path from class start to the
+-- socket when it isn't already allocated.
+--
+-- Non-cluster only: PoE 2 has no cluster jewels (POB2-7), so all cluster-subgraph
+-- handling (autoAllocateNotables, _fixClusterJewelValid, BuildClusterJewelGraphs)
+-- from the PoE 1 port is intentionally absent here.
+function M.set_jewel(params)
+  if not build or not build.spec then return nil, 'build/spec not initialized' end
+  if not build.itemsTab         then return nil, 'items not initialized' end
+  if type(params) ~= 'table'    then return nil, 'invalid params' end
+
+  local nodeId = tonumber(params.nodeId)
+  if not nodeId then return nil, 'missing or invalid nodeId' end
+
+  local spec = build.spec
+  local itemsTab = build.itemsTab
+  local socketCtrl = itemsTab.sockets[nodeId]
+  if not socketCtrl then
+    return nil, 'nodeId ' .. tostring(nodeId) .. ' is not a jewel socket'
+  end
+
+  -- Auto-allocate the socket (+ optional path to it) when it isn't allocated.
+  -- Uses the direct spec.allocNodes[] mutation pattern proven out in
+  -- calc_with_jewel — skips the 9-arg ImportFromNodeList ceremony (POB2-9)
+  -- for this narrow case where we're only adding to the allocation set.
+  local allocatedPathIds = nil
+  if not spec.allocNodes[nodeId] then
+    allocatedPathIds = {}
+    if params.autoAllocateSocketPath then
+      local pathResult, pathErr = M.find_path({ targetNodeId = nodeId })
+      if not pathResult then
+        return nil, 'failed to path to socket ' .. tostring(nodeId) .. ': ' .. tostring(pathErr)
+      end
+      for _, pn in ipairs(pathResult.path or {}) do
+        local pid = tonumber(pn.id)
+        if pid then
+          local node = spec.nodes[pid]
+          if node and not spec.allocNodes[pid] then
+            node.alloc = true
+            spec.allocNodes[pid] = node
+            table.insert(allocatedPathIds, pid)
+          end
+        end
+      end
+    end
+    -- Always allocate the socket itself.
+    local socketNode = spec.nodes[nodeId]
+    if socketNode and not spec.allocNodes[nodeId] then
+      socketNode.alloc = true
+      spec.allocNodes[nodeId] = socketNode
+      table.insert(allocatedPathIds, nodeId)
+    end
+  end
+
+  -- Resolve item: either parse from text, or look up an existing itemId.
+  local itemId, item
+  if params.text then
+    if #params.text == 0 then return nil, 'item text cannot be empty' end
+    if #params.text > MAX_ITEM_TEXT_LENGTH then
+      return nil, string.format('item text too long (max %d bytes)', MAX_ITEM_TEXT_LENGTH)
+    end
+    local ok, parsed = pcall(new, 'Item', params.text)
+    if not ok then return nil, 'invalid item text: ' .. tostring(parsed) end
+    if not parsed or not parsed.baseName then return nil, 'failed to parse item' end
+    if parsed.type ~= 'Jewel' then
+      return nil, 'item is not a jewel (type: ' .. tostring(parsed.type) .. ')'
+    end
+    parsed:NormaliseQuality()
+    itemsTab:AddItem(parsed, true) -- noAutoEquip = true; we equip manually
+    itemId = parsed.id
+    item = parsed
+  elseif params.itemId then
+    itemId = tonumber(params.itemId)
+    if not itemId or not itemsTab.items[itemId] then
+      return nil, 'invalid itemId or item not found'
+    end
+    item = itemsTab.items[itemId]
+  else
+    return nil, 'must provide either text or itemId'
+  end
+
+  -- Equip via the socket control — this writes both spec.jewels[nodeId] and
+  -- the slot's selItemId atomically. PopulateSlots + buildFlag + get_main_output
+  -- rebuild calcs with the jewel in place.
+  local slotName = socketCtrl.slotName
+  socketCtrl:SetSelItemId(itemId)
+  itemsTab:PopulateSlots()
+  itemsTab:AddUndoState()
+  build.buildFlag = true
+  M.get_main_output()
+
+  return {
+    nodeId             = nodeId,
+    slotName           = slotName,
+    itemId             = itemId,
+    name               = item and item.name or nil,
+    baseName           = item and item.baseName or nil,
+    allocatedPathNodes = allocatedPathIds, -- nil if socket was already allocated
+  }
+end
+
+-- Remove a jewel from a tree socket. Leaves the socket node itself allocated
+-- (callers who want to deallocate use update_tree_delta). Returns the
+-- previously-equipped jewel id for audit.
+function M.remove_jewel(params)
+  if not build or not build.spec then return nil, 'build/spec not initialized' end
+  if not build.itemsTab         then return nil, 'items not initialized' end
+  if type(params) ~= 'table'    then return nil, 'invalid params' end
+
+  local nodeId = tonumber(params.nodeId)
+  if not nodeId then return nil, 'missing or invalid nodeId' end
+
+  local spec = build.spec
+  local itemsTab = build.itemsTab
+  local socketCtrl = itemsTab.sockets[nodeId]
+  if not socketCtrl then
+    return nil, 'nodeId ' .. tostring(nodeId) .. ' is not a jewel socket'
+  end
+
+  local slotName = socketCtrl.slotName
+  local previousJewelId = spec.jewels[nodeId] or 0
+
+  -- SetSelItemId(0) clears both spec.jewels[nodeId] and slot.selItemId.
+  socketCtrl:SetSelItemId(0)
+  itemsTab:PopulateSlots()
+  itemsTab:AddUndoState()
+  build.buildFlag = true
+  M.get_main_output()
+
+  return {
+    nodeId          = nodeId,
+    slotName        = slotName,
+    previousJewelId = previousJewelId,
+  }
+end
+
+-- ============================================================================
 -- Config tier
 -- ============================================================================
 --
