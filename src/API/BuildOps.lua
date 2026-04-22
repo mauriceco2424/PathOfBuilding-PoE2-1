@@ -2064,4 +2064,364 @@ function M.calc_with_jewel(params)
   return result
 end
 
+-- ============================================================================
+-- Config tier
+-- ============================================================================
+--
+-- PoB2 deltas from PoB1 that shape this tier (POB2-14 in pob2-integration-notes):
+--
+--   * PoE 2 has no Bandit quest (`bandit` key gone) and no Pantheon system
+--     (`pantheonMajorGod` / `pantheonMinorGod` gone). The whole PoE 1 act-1
+--     reward subsystem is missing.
+--   * PoE 2 renames `enemyPhysicalDamageReduction` → `enemyPhysicalReduction`.
+--   * PoE 2 drops PoE 1-only buffs: `buffTailwind`, `buffConvergence`.
+--   * PoE 2 adds new ailment / condition keys — this tier surfaces the ones
+--     the backend needs: armour break, daze, pin, heavy stun, electrocute,
+--     ailment consumption, sprint/dodge, charm usage, darkness.
+--   * PoB2 configTab.input is a live reference to configSets[activeConfigSetId].input
+--     after SetActiveConfigSet (ConfigTab.lua:997) — reading/writing either is equivalent.
+--
+-- Flasks: PoB2 has NUM_FLASK_SLOTS = 2 (vs PoE 1's 5) + 3 Charm slots. See
+-- set_flask_active below for slot-name handling.
+
+local NUM_FLASK_SLOTS = 2
+local NUM_CHARM_SLOTS = 3
+
+-- Minimal config snapshot for callers that only need the essentials.
+function M.get_config()
+  if not build or not build.configTab then return nil, 'build/config not initialized' end
+  local input = build.configTab.input or {}
+  local cfg = {
+    enemyLevel        = build.configTab.enemyLevel,
+    resistancePenalty = input.resistancePenalty,
+    customMods        = input.customMods or "",
+  }
+  return cfg
+end
+
+-- Comprehensive config snapshot mirroring the PoE 1 handler shape. Keys are
+-- PoB2-verified — PoE 1-only keys (bandit, pantheon*, buffTailwind,
+-- buffConvergence, enemyPhysicalDamageReduction) are dropped; PoE 2-only keys
+-- (electrocute / armour break / daze / pin / heavy stun / ailment consumption
+-- / sprint / charm / darkness) are added.
+function M.get_full_config()
+  if not build or not build.configTab then return nil, 'build/config not initialized' end
+  local input = build.configTab.input or {}
+  local cfg = {
+    -- Basic config. `enemyLevel` is the effective level in use (auto-derived
+    -- from placeholder / character level when no explicit override is set).
+    -- `enemyLevelOverride` surfaces the explicit override separately so callers
+    -- can distinguish "user-set" from "auto-scaled".
+    enemyLevel         = build.configTab.enemyLevel,
+    enemyLevelOverride = input.enemyLevel,
+    resistancePenalty  = input.resistancePenalty,
+
+    -- Calc modes
+    ailmentMode           = input.ailmentMode,
+    cooldownMode          = input.cooldownMode,       -- NEW in PoE 2
+    lifeRegenMode         = input.lifeRegenMode,
+    resourceGainMode      = input.resourceGainMode,
+    armourCalculationMode = input.armourCalculationMode,
+    EHPUnluckyWorstOf     = input.EHPUnluckyWorstOf,
+
+    -- Charges
+    usePowerCharges         = input.usePowerCharges or false,
+    useFrenzyCharges        = input.useFrenzyCharges or false,
+    useEnduranceCharges     = input.useEnduranceCharges or false,
+    overridePowerCharges    = input.overridePowerCharges,
+    overrideFrenzyCharges   = input.overrideFrenzyCharges,
+    overrideEnduranceCharges = input.overrideEnduranceCharges,
+
+    -- Combat buffs (PoE 2 roster — buffTailwind / buffConvergence gone)
+    buffOnslaught      = input.buffOnslaught or false,
+    buffFortification  = input.buffFortification or false,
+    overrideFortification = input.overrideFortification,
+    buffAdrenaline     = input.buffAdrenaline or false,
+    buffUnholyMight    = input.buffUnholyMight or false,
+    buffPhasing        = input.buffPhasing or false,
+    buffElusive        = input.buffElusive or false,
+    buffArcaneSurge    = input.buffArcaneSurge or false,
+    buffFanaticism     = input.buffFanaticism or false,
+    buffDivinity       = input.buffDivinity or false,
+    conditionUsingFlask = input.conditionUsingFlask or false,
+    conditionUsingCharm = input.conditionUsingCharm or false, -- NEW in PoE 2
+
+    -- Self conditions
+    conditionLowLife             = input.conditionLowLife or false,
+    conditionFullLife            = input.conditionFullLife or false,
+    conditionLowMana             = input.conditionLowMana or false,
+    conditionFullMana            = input.conditionFullMana or false,
+    conditionLeeching            = input.conditionLeeching or false,
+    conditionOnConsecratedGround = input.conditionOnConsecratedGround or false,
+    conditionKilledRecently      = input.conditionKilledRecently or false,
+    conditionHitRecently         = input.conditionHitRecently or false,
+    conditionCritRecently        = input.conditionCritRecently or false,
+    conditionBeenHitRecently     = input.conditionBeenHitRecently or false,
+    conditionMoving              = input.conditionMoving or false,
+    conditionSprinting           = input.conditionSprinting or false,           -- NEW in PoE 2
+    conditionDodgeRolledRecently = input.conditionDodgeRolledRecently or false, -- NEW in PoE 2
+    conditionInDodgeRoll         = input.conditionInDodgeRoll or false,         -- NEW in PoE 2
+
+    -- PoE 2 ailment-consumption flags (driving POE 2's payoff / combo skills)
+    conditionAilmentConsumed = input.conditionAilmentConsumed or false,
+    conditionIgniteConsumed  = input.conditionIgniteConsumed or false,
+    conditionFreezeConsumed  = input.conditionFreezeConsumed or false,
+    conditionShockConsumed   = input.conditionShockConsumed or false,
+
+    -- Darkness reservation (PoE 2 Chaos pool)
+    reservedDarkness = input.reservedDarkness,
+
+    -- Enemy basics
+    enemyIsBoss = input.enemyIsBoss or "Pinnacle",
+
+    -- Enemy ailments / conditions (full PoE 2 roster)
+    conditionEnemyIntimidated      = input.conditionEnemyIntimidated or false,
+    conditionEnemyUnnerved         = input.conditionEnemyUnnerved or false,
+    conditionEnemyCoveredInAsh     = input.conditionEnemyCoveredInAsh or false,
+    conditionEnemyCoveredInFrost   = input.conditionEnemyCoveredInFrost or false,
+    conditionEnemyMaimed           = input.conditionEnemyMaimed or false,
+    conditionEnemyBleeding         = input.conditionEnemyBleeding or false,
+    conditionEnemyPoisoned         = input.conditionEnemyPoisoned or false,
+    conditionEnemyIgnited          = input.conditionEnemyIgnited or false,
+    conditionEnemyBurning          = input.conditionEnemyBurning or false,
+    conditionEnemyHindered         = input.conditionEnemyHindered or false,
+    conditionEnemyTaunted          = input.conditionEnemyTaunted or false,
+    conditionEnemyDebilitated      = input.conditionEnemyDebilitated or false,
+    conditionEnemyFireExposure     = input.conditionEnemyFireExposure or false,
+    conditionEnemyColdExposure     = input.conditionEnemyColdExposure or false,
+    conditionEnemyLightningExposure = input.conditionEnemyLightningExposure or false,
+    conditionEnemyScorched         = input.conditionEnemyScorched or false,
+    conditionEnemyBrittle          = input.conditionEnemyBrittle or false,
+    conditionEnemySapped           = input.conditionEnemySapped or false,
+    conditionEnemyChilled          = input.conditionEnemyChilled or false,
+    conditionEnemyShocked          = input.conditionEnemyShocked or false,
+    conditionEnemyCrushed          = input.conditionEnemyCrushed or false,
+    conditionEnemyBlinded          = input.conditionEnemyBlinded or false,
+    -- PoE 2-only enemy conditions
+    conditionEnemyElectrocuted  = input.conditionEnemyElectrocuted or false,
+    conditionEnemyArmourBroken  = input.conditionEnemyArmourBroken or false,
+    conditionEnemyDazed         = input.conditionEnemyDazed or false,
+    conditionEnemyHeavyStunned  = input.conditionEnemyHeavyStunned or false,
+    conditionHitsAlwaysHeavyStun = input.conditionHitsAlwaysHeavyStun or false,
+    conditionEnemyPinned        = input.conditionEnemyPinned or false,
+    conditionEnemyImmobilised   = input.conditionEnemyImmobilised or false,
+
+    -- Enemy stat overrides (NOTE: enemyPhysicalReduction, NOT
+    -- enemyPhysicalDamageReduction — renamed in PoB2)
+    enemyFireResist         = input.enemyFireResist,
+    enemyColdResist         = input.enemyColdResist,
+    enemyLightningResist    = input.enemyLightningResist,
+    enemyChaosResist        = input.enemyChaosResist,
+    enemyPhysicalReduction  = input.enemyPhysicalReduction,
+
+    -- Numeric ailment / stack multipliers surfaced for set_skill_config
+    multiplierWitheredStackCount = input.multiplierWitheredStackCount or 0,
+    conditionShockEffect         = input.conditionShockEffect or 0,
+    conditionEnemyChilledEffect  = input.conditionEnemyChilledEffect or 0,
+    conditionScorchedEffect      = input.conditionScorchedEffect or 0,
+    conditionBrittleEffect       = input.conditionBrittleEffect or 0,
+    conditionSapEffect           = input.conditionSapEffect or 0,
+    multiplierPoisonOnEnemy      = input.multiplierPoisonOnEnemy or 0,
+    multiplierImpalesOnEnemy     = input.multiplierImpalesOnEnemy or 0,
+    multiplierRuptureStacks      = input.multiplierRuptureStacks or 0,
+    multiplierCorrosionStackCount = input.multiplierCorrosionStackCount or 0,
+    multiplierArmourBreak        = input.multiplierArmourBreak or 0,       -- NEW in PoE 2
+
+    -- Custom modifiers + curse override (A/B testing hook from PoE 1)
+    customMods         = input.customMods or "",
+    disabledCurses     = input.disabledCurses,
+    overrideCurseLimit = input.overrideCurseLimit,
+  }
+  return cfg
+end
+
+-- Mutate selected config values and rebuild. Preserves the input-restoration
+-- pattern from PoE 1: BuildModList can wipe vars that weren't touched by this
+-- call, so we snapshot first and restore anything that got wiped but wasn't
+-- explicitly overridden.
+function M.set_config(params)
+  if not build or not build.configTab then return nil, 'build/config not initialized' end
+  if type(params) ~= 'table' then return nil, 'invalid params' end
+  local input = build.configTab.input
+  if not input then
+    -- Fresh builds that bypassed SetActiveConfigSet — fall back to the active
+    -- set's input table. This shouldn't happen in practice because new_build
+    -- runs through ConfigTab:SetActiveConfigSet, but guard anyway.
+    if build.configTab.configSets and build.configTab.activeConfigSetId then
+      local cs = build.configTab.configSets[build.configTab.activeConfigSetId]
+      input = cs and cs.input or nil
+    end
+    if not input then return nil, 'configTab.input unavailable' end
+    build.configTab.input = input
+  end
+  local changed = false
+
+  -- Basic config. NOTE: write to input.enemyLevel, NOT build.configTab.enemyLevel
+  -- directly — BuildModList re-derives self.enemyLevel from input (ConfigTab.lua
+  -- :856-862). Direct writes to configTab.enemyLevel get overwritten on the next
+  -- BuildModList, which is exactly the rebuild we then trigger below.
+  if params.enemyLevel ~= nil then
+    input.enemyLevel = tonumber(params.enemyLevel) or input.enemyLevel
+    changed = true
+  end
+  if params.resistancePenalty ~= nil then input.resistancePenalty = tonumber(params.resistancePenalty); changed = true end
+
+  -- Calc modes (string enums)
+  local stringEnums = {
+    'ailmentMode', 'cooldownMode', 'lifeRegenMode', 'resourceGainMode',
+    'armourCalculationMode', 'enemyIsBoss',
+  }
+  for _, k in ipairs(stringEnums) do
+    if params[k] ~= nil then input[k] = tostring(params[k]); changed = true end
+  end
+  if params.EHPUnluckyWorstOf ~= nil then input.EHPUnluckyWorstOf = tonumber(params.EHPUnluckyWorstOf); changed = true end
+
+  -- Boolean config keys — one list, driven by the full PoE 2 condition roster.
+  local boolKeys = {
+    -- Charges
+    'usePowerCharges', 'useFrenzyCharges', 'useEnduranceCharges',
+    -- Buffs
+    'buffOnslaught', 'buffFortification', 'buffAdrenaline', 'buffUnholyMight',
+    'buffPhasing', 'buffElusive', 'buffArcaneSurge', 'buffFanaticism', 'buffDivinity',
+    'conditionUsingFlask', 'conditionUsingCharm',
+    -- Self conditions
+    'conditionLowLife', 'conditionFullLife', 'conditionLowMana', 'conditionFullMana',
+    'conditionLeeching', 'conditionOnConsecratedGround', 'conditionKilledRecently',
+    'conditionHitRecently', 'conditionCritRecently', 'conditionBeenHitRecently',
+    'conditionMoving', 'conditionSprinting', 'conditionDodgeRolledRecently',
+    'conditionInDodgeRoll',
+    -- PoE 2 ailment-consumed
+    'conditionAilmentConsumed', 'conditionIgniteConsumed', 'conditionFreezeConsumed',
+    'conditionShockConsumed',
+    -- Enemy conditions (shared PoE 1 + 2)
+    'conditionEnemyIntimidated', 'conditionEnemyUnnerved', 'conditionEnemyCoveredInAsh',
+    'conditionEnemyCoveredInFrost', 'conditionEnemyMaimed', 'conditionEnemyBleeding',
+    'conditionEnemyPoisoned', 'conditionEnemyIgnited', 'conditionEnemyBurning',
+    'conditionEnemyHindered', 'conditionEnemyTaunted', 'conditionEnemyDebilitated',
+    'conditionEnemyFireExposure', 'conditionEnemyColdExposure', 'conditionEnemyLightningExposure',
+    'conditionEnemyScorched', 'conditionEnemyBrittle', 'conditionEnemySapped',
+    'conditionEnemyChilled', 'conditionEnemyShocked', 'conditionEnemyCrushed',
+    'conditionEnemyBlinded',
+    -- Enemy conditions (PoE 2-only)
+    'conditionEnemyElectrocuted', 'conditionEnemyArmourBroken', 'conditionEnemyDazed',
+    'conditionEnemyHeavyStunned', 'conditionHitsAlwaysHeavyStun', 'conditionEnemyPinned',
+    'conditionEnemyImmobilised',
+  }
+  for _, k in ipairs(boolKeys) do
+    if params[k] ~= nil then input[k] = params[k]; changed = true end
+  end
+
+  -- Numeric overrides (fall back to nil when missing so placeholders drive)
+  local numericKeys = {
+    'overridePowerCharges', 'overrideFrenzyCharges', 'overrideEnduranceCharges',
+    'overrideFortification', 'reservedDarkness',
+    'enemyFireResist', 'enemyColdResist', 'enemyLightningResist', 'enemyChaosResist',
+    'enemyPhysicalReduction',
+  }
+  for _, k in ipairs(numericKeys) do
+    if params[k] ~= nil then input[k] = tonumber(params[k]); changed = true end
+  end
+
+  -- Numeric-stack keys — when set to 0, clear the placeholder too (same
+  -- rationale as PoE 1: BuildModList falls back to auto-calculated placeholder
+  -- otherwise, so "0" wouldn't round-trip without this guard).
+  local placeholder = build.configTab.configSets
+    and build.configTab.configSets[build.configTab.activeConfigSetId]
+    and build.configTab.configSets[build.configTab.activeConfigSetId].placeholder
+  local function setNumericVar(varName, rawValue)
+    local val = tonumber(rawValue)
+    input[varName] = val
+    if val == 0 and placeholder then placeholder[varName] = nil end
+    changed = true
+  end
+  local numericStackKeys = {
+    'multiplierWitheredStackCount', 'conditionShockEffect', 'conditionEnemyChilledEffect',
+    'conditionScorchedEffect', 'conditionBrittleEffect', 'conditionSapEffect',
+    'multiplierPoisonOnEnemy', 'multiplierImpalesOnEnemy', 'multiplierRuptureStacks',
+    'multiplierCorrosionStackCount', 'multiplierArmourBreak',
+  }
+  for _, k in ipairs(numericStackKeys) do
+    if params[k] ~= nil then setNumericVar(k, params[k]) end
+  end
+
+  -- Custom mods (freeform string)
+  if params.customMods ~= nil then input.customMods = tostring(params.customMods); changed = true end
+
+  -- Curse override hook (mirrors PoE 1 API; PoB2 curse modelling matches so far)
+  if params.resetApiConfig then
+    input.disabledCurses = nil
+    input.overrideCurseLimit = nil
+    changed = true
+  end
+  if params.disabledCurses ~= nil then
+    if type(params.disabledCurses) == 'table' then
+      input.disabledCurses = params.disabledCurses
+    else
+      input.disabledCurses = nil
+    end
+    changed = true
+  end
+  if params.overrideCurseLimit ~= nil then
+    input.overrideCurseLimit = tonumber(params.overrideCurseLimit)
+    changed = true
+  end
+
+  -- Snapshot → rebuild → restore pattern. BuildModList reconstructs the mod
+  -- list from ConfigOptions and can reset vars that we set via the API but
+  -- didn't explicitly pass this call. Restore only keys NOT in the current
+  -- params (those we *did* pass are authoritative).
+  local savedInput = {}
+  for k, v in pairs(input) do savedInput[k] = v end
+
+  if changed and build.configTab.BuildModList then build.configTab:BuildModList() end
+
+  for k, v in pairs(savedInput) do
+    if input[k] ~= v and params[k] == nil then
+      input[k] = v
+    end
+  end
+
+  build.buildFlag = true
+  M.get_main_output()
+  return true
+end
+
+-- Toggle a flask or charm slot on/off. PoE 2 flask slots are "Flask 1"/"Flask 2"
+-- (NUM_FLASK_SLOTS=2) and charms are "Charm 1".."Charm 3" (POB2-10). Callers
+-- pick the slot family via `slotType` ("flask" default, or "charm") + index,
+-- or pass `slot` explicitly for full control.
+function M.set_flask_active(params)
+  if not build or not build.itemsTab then return nil, 'items not initialized' end
+  if type(params) ~= 'table' then return nil, 'invalid params' end
+
+  local slotName
+  if params.slot then
+    slotName = tostring(params.slot)
+  else
+    local slotType = params.slotType and tostring(params.slotType):lower() or 'flask'
+    local idx = tonumber(params.index)
+    local maxIdx = slotType == 'charm' and NUM_CHARM_SLOTS or NUM_FLASK_SLOTS
+    if not idx or idx < 1 or idx > maxIdx then
+      return nil, string.format('invalid index (must be 1-%d for %s)', maxIdx, slotType)
+    end
+    slotName = (slotType == 'charm' and 'Charm ' or 'Flask ') .. tostring(idx)
+  end
+
+  local active = params.active == true
+  if not build.itemsTab.activeItemSet or not build.itemsTab.activeItemSet[slotName] then
+    return nil, 'slot not found: ' .. slotName
+  end
+  build.itemsTab.activeItemSet[slotName].active = active
+  if build.itemsTab.slots[slotName] then
+    build.itemsTab.slots[slotName].active = active
+    if build.itemsTab.slots[slotName].controls and build.itemsTab.slots[slotName].controls.activate then
+      build.itemsTab.slots[slotName].controls.activate.state = active
+    end
+  end
+  build.itemsTab:AddUndoState()
+  build.buildFlag = true
+  M.get_main_output()
+  return true
+end
+
 return M

@@ -389,6 +389,32 @@ handlers.calc_with_jewel = function(params)
   }
 end
 
+-- Config tier ----------------------------------------------------------------
+
+handlers.get_config = function(params)
+  local cfg, err = BuildOps.get_config()
+  if not cfg then return { ok = false, error = err } end
+  return { ok = true, config = cfg }
+end
+
+handlers.get_full_config = function(params)
+  local cfg, err = BuildOps.get_full_config()
+  if not cfg then return { ok = false, error = err } end
+  return { ok = true, config = cfg }
+end
+
+handlers.set_config = function(params)
+  local ok2, err = BuildOps.set_config(params or {})
+  if not ok2 then return { ok = false, error = err } end
+  return { ok = true }
+end
+
+handlers.set_flask_active = function(params)
+  local ok2, err = BuildOps.set_flask_active(params or {})
+  if not ok2 then return { ok = false, error = err } end
+  return { ok = true }
+end
+
 return {
   handlers     = handlers,
   version_meta = version_meta,
