@@ -221,6 +221,21 @@ handlers.get_stats = function(params)
   return { ok = true, stats = stats }
 end
 
+handlers.get_full_calcs = function(params)
+  checkMemoryPressure()
+  local res, err = BuildOps.get_full_calcs()
+  if not res then return { ok = false, error = err } end
+  return {
+    ok                  = true,
+    mainOutput          = res.mainOutput,
+    config              = res.config,
+    skills              = res.skills,
+    activeSkill         = res.activeSkill,
+    perSkillDPS         = res.perSkillDPS,
+    perSkillReservation = res.perSkillReservation,
+  }
+end
+
 handlers.gc_collect = function(params)
   collectgarbage("collect")
   collectgarbage("collect")

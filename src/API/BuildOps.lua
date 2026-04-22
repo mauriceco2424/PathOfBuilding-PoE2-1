@@ -134,6 +134,240 @@ function M.export_stats(fields)
   return result
 end
 
+-- Full calcs dump — the heavy stats surface for LangChain tools / analysis.
+-- Goes beyond export_stats by also returning per-skill DPS, per-skill
+-- reservation (mana/life/spirit — PoE 2 adds Spirit), active skill name,
+-- config snapshot, and skill-tier summary. Used when get_stats' curated list
+-- isn't enough (e.g. investigating "why is my DPS low?" with full context).
+--
+-- PoB2 deltas from PoB1 that shape this handler:
+--
+--   * Per-skill reservation now includes Spirit. PoE 2's primary reservation
+--     pool is Spirit (POB2-5), and CalcDefence.lua:285/302 writes
+--     activeSkill.skillData.SpiritReservedBase / .SpiritReservedPercent with
+--     the same shape as Life/Mana. We surface all three pools.
+--   * `calcsTab.output` / `calcsTab.skillOutput` / `calcsTab.breakdown` from
+--     PoB1 are renamed in PoB2: the CALCS-mode output is `calcsTab.calcsOutput`,
+--     breakdown lives on `calcsTab.calcsEnv.player.breakdown`. They're
+--     INTENTIONALLY NOT SURFACED here — the payloads are huge (every
+--     breakdown for every stat) and PoE 1 only used them for deep debug.
+--     If a caller actually needs CALCS-mode detail, add a dedicated handler.
+--   * `_computeArmyDps` is PoE 1's minion DPS rollup — minion tier not
+--     ported yet, so we skip it. When the minion tier lands, inject the call
+--     back here so baselines stay shape-consistent.
+--   * FullDPS best-skill overlay retained — still useful: when no socket group
+--     has `includeInFullDPS` flipped, mainOutput.FullDPS stays 0 and the main
+--     skill's DPS lives in a per-skill cache only. We detect that and overlay
+--     the best skill's fields onto mainOutput so callers get real numbers.
+--   * MainHand / OffHand Accuracy surfacing retained — PoE 2 still nests
+--     per-weapon-pass stats on mainOutput.MainHand / .OffHand sub-tables.
+function M.get_full_calcs()
+  if not build or not build.calcsTab then return nil, 'build not initialized' end
+
+  -- Idempotent rebuild — same discipline as get_main_output. See that comment
+  -- for the rationale (cached-output divergence between back-to-back calls).
+  wipeGlobalCache()
+  build.buildFlag = false
+  if build.calcsTab.BuildOutput then build.calcsTab:BuildOutput() end
+
+  local calcsTab = build.calcsTab
+  local mainOutput = calcsTab.mainOutput or {}
+  local mainEnv = calcsTab.mainEnv
+
+  -- CurseList / BuffList — mainEnv.curseSlots and mainEnv.debuffs/buffs ARE
+  -- populated during the MAIN pass (CalcPerform.lua:1704/1709/2740). Inject
+  -- them into mainOutput so callers don't have to walk the env.
+  if mainEnv then
+    if not mainOutput.CurseList then
+      local names = {}
+      if mainEnv.debuffs then
+        for name, _ in pairs(mainEnv.debuffs) do table.insert(names, name) end
+      end
+      if mainEnv.curseSlots then
+        for _, slot in ipairs(mainEnv.curseSlots) do
+          if slot.name then table.insert(names, slot.name) end
+        end
+      end
+      table.sort(names)
+      mainOutput.CurseList = table.concat(names, ", ")
+    end
+    if mainEnv.buffs and not mainOutput.BuffList then
+      local names = {}
+      for name, _ in pairs(mainEnv.buffs) do table.insert(names, name) end
+      table.sort(names)
+      mainOutput.BuffList = table.concat(names, ", ")
+    end
+  end
+
+  -- Identify the active skill from the calc env (not build.activeSkill — that's
+  -- a GUI control and isn't always authoritative).
+  local activeSkillName = nil
+  if mainEnv and mainEnv.player and mainEnv.player.mainSkill then
+    local ms = mainEnv.player.mainSkill
+    if ms.activeEffect and ms.activeEffect.grantedEffect then
+      activeSkillName = ms.activeEffect.grantedEffect.name
+    end
+  end
+
+  -- Per-skill DPS. Walk activeSkillList; for each enabled socket group, pull
+  -- that skill's cached output from GlobalCache["MAIN"][uuid]. Cache is
+  -- populated by CalcPerform.lua:3269 (end-of-MAIN-pass cacheData call) —
+  -- every enabled active skill ends up with an entry.
+  local perSkillDPS = {}
+  if mainEnv and mainEnv.player and mainEnv.player.activeSkillList then
+    for _, activeSkill in ipairs(mainEnv.player.activeSkillList) do
+      if activeSkill.socketGroup and activeSkill.socketGroup.enabled then
+        local skillName
+        if activeSkill.activeEffect and activeSkill.activeEffect.grantedEffect then
+          skillName = activeSkill.activeEffect.grantedEffect.name
+        end
+        if skillName then
+          local uuid = cacheSkillUUID and cacheSkillUUID(activeSkill, mainEnv) or nil
+          local skillOut
+          if uuid and GlobalCache and GlobalCache.cachedData and GlobalCache.cachedData["MAIN"] and GlobalCache.cachedData["MAIN"][uuid] then
+            local cached = GlobalCache.cachedData["MAIN"][uuid]
+            skillOut = cached.Env and cached.Env.player and cached.Env.player.output
+          end
+          if skillOut then
+            table.insert(perSkillDPS, {
+              name             = skillName,
+              CombinedDPS      = skillOut.CombinedDPS or 0,
+              TotalDPS         = skillOut.TotalDPS or 0,
+              TotalDotDPS      = skillOut.TotalDotDPS or 0,
+              TotalPoisonDPS   = skillOut.TotalPoisonDPS or 0,
+              PoisonDPS        = skillOut.PoisonDPS,
+              WithPoisonDPS    = skillOut.WithPoisonDPS or 0,
+              BleedDPS         = skillOut.BleedDPS or 0,
+              IgniteDPS        = skillOut.IgniteDPS or 0,
+              includeInFullDPS = activeSkill.socketGroup.includeInFullDPS or false,
+            })
+          end
+        end
+      end
+    end
+  end
+
+  -- FullDPS fallback. When no socket group has includeInFullDPS flipped,
+  -- mainOutput.FullDPS stays 0 and the caller can't tell what the build's
+  -- actually doing. Find the highest-CombinedDPS non-support skill and
+  -- overlay its damage fields onto mainOutput.
+  if not mainOutput.FullDPS or mainOutput.FullDPS == 0 then
+    local bestDPS = 0
+    local bestSkillOut, bestSkillName
+    if mainEnv and mainEnv.player and mainEnv.player.activeSkillList then
+      for _, activeSkill in ipairs(mainEnv.player.activeSkillList) do
+        if activeSkill.socketGroup and activeSkill.socketGroup.enabled
+           and activeSkill.activeEffect and activeSkill.activeEffect.grantedEffect
+           and not activeSkill.activeEffect.grantedEffect.support then
+          local uuid = cacheSkillUUID and cacheSkillUUID(activeSkill, mainEnv) or nil
+          if uuid and GlobalCache and GlobalCache.cachedData and GlobalCache.cachedData["MAIN"] and GlobalCache.cachedData["MAIN"][uuid] then
+            local cached = GlobalCache.cachedData["MAIN"][uuid]
+            local so = cached.Env and cached.Env.player and cached.Env.player.output
+            if so and (so.CombinedDPS or 0) > bestDPS then
+              bestDPS = so.CombinedDPS
+              bestSkillOut = so
+              bestSkillName = activeSkill.activeEffect.grantedEffect.name
+            end
+          end
+        end
+      end
+    end
+    if bestSkillOut and bestDPS > (mainOutput.CombinedDPS or 0) then
+      local dpsFields = {
+        "CombinedDPS", "TotalDPS", "TotalDotDPS", "TotalPoisonDPS", "PoisonDPS",
+        "WithPoisonDPS", "BleedDPS", "IgniteDPS", "TotalIgniteDPS", "DecayDPS",
+        "ImpaleDPS", "HitDPS", "AverageDamage", "Speed", "CritChance",
+        "CritMultiplier", "EffectiveCritChance", "PoisonChance", "PoisonDamage",
+        "TotalDot", "MirageDPS", "CullingDPS",
+        "Accuracy", "HitChance", "PreEffectiveCritChance",
+        "AverageHit", "AverageBurstDamage", "AverageBurstHits",
+        "PhysicalHitAverage", "FireHitAverage", "ColdHitAverage",
+        "LightningHitAverage", "ChaosHitAverage",
+        "FirePenetration", "ColdPenetration", "LightningPenetration", "ChaosPenetration",
+      }
+      for _, field in ipairs(dpsFields) do
+        if bestSkillOut[field] ~= nil then mainOutput[field] = bestSkillOut[field] end
+      end
+      mainOutput.FullDPS = bestDPS
+      activeSkillName = bestSkillName
+    elseif mainOutput.CombinedDPS and mainOutput.CombinedDPS > 0 then
+      mainOutput.FullDPS = mainOutput.CombinedDPS
+    end
+  end
+
+  -- Surface per-hand accuracy/hit chance when top-level is missing.
+  -- CalcOffence populates mainOutput.MainHand / .OffHand sub-tables with
+  -- per-weapon-pass numbers; for attack builds, mainOutput.Accuracy at the
+  -- top level can be nil while the actual value lives in the sub-table.
+  if (not mainOutput.Accuracy or mainOutput.Accuracy == 0) then
+    local mh = mainOutput.MainHand
+    local oh = mainOutput.OffHand
+    if type(mh) == "table" and mh.Accuracy and mh.Accuracy > 0 then
+      mainOutput.Accuracy = mh.Accuracy
+    elseif type(oh) == "table" and oh.Accuracy and oh.Accuracy > 0 then
+      mainOutput.Accuracy = oh.Accuracy
+    end
+  end
+  if (not mainOutput.AccuracyHitChance or mainOutput.AccuracyHitChance == 0) then
+    local mh = mainOutput.MainHand
+    if type(mh) == "table" and mh.AccuracyHitChance and mh.AccuracyHitChance > 0 then
+      mainOutput.AccuracyHitChance = mh.AccuracyHitChance
+    end
+  end
+
+  -- Per-skill reservation breakdown. Reads values set by CalcDefence.lua:285-302
+  -- (doActorLifeManaSpiritReservation). PoE 2 adds Spirit — the primary
+  -- reservation pool (POB2-5) — so we report all three pools per skill.
+  local perSkillReservation = {}
+  if mainEnv and mainEnv.player and mainEnv.player.activeSkillList then
+    for _, activeSkill in ipairs(mainEnv.player.activeSkillList) do
+      local sd = activeSkill.skillData
+      if sd then
+        local manaPct   = sd.ManaReservedPercent or 0
+        local manaFlat  = sd.ManaReservedBase or 0
+        local lifePct   = sd.LifeReservedPercent or 0
+        local lifeFlat  = sd.LifeReservedBase or 0
+        local spiritPct  = sd.SpiritReservedPercent or 0
+        local spiritFlat = sd.SpiritReservedBase or 0
+        -- When reservation is percent-based, base is a computed flat equivalent
+        -- (pool * percent / 100). Only report "real" flat reservations —
+        -- percent==0 AND flat>0 — to avoid a misleading redundant flat entry.
+        local flatOnlyMana   = manaPct == 0   and manaFlat > 0
+        local flatOnlyLife   = lifePct == 0   and lifeFlat > 0
+        local flatOnlySpirit = spiritPct == 0 and spiritFlat > 0
+        local hasAny = manaPct > 0 or lifePct > 0 or spiritPct > 0
+                    or flatOnlyMana or flatOnlyLife or flatOnlySpirit
+        if hasAny then
+          local skillName
+          if activeSkill.activeEffect and activeSkill.activeEffect.grantedEffect then
+            skillName = activeSkill.activeEffect.grantedEffect.name
+          end
+          if skillName then
+            table.insert(perSkillReservation, {
+              name         = skillName,
+              manaPercent  = manaPct,
+              manaFlat     = flatOnlyMana and manaFlat or 0,
+              lifePercent  = lifePct,
+              lifeFlat     = flatOnlyLife and lifeFlat or 0,
+              spiritPercent = spiritPct,
+              spiritFlat   = flatOnlySpirit and spiritFlat or 0,
+            })
+          end
+        end
+      end
+    end
+  end
+
+  return {
+    mainOutput          = deepCopySafe(mainOutput),
+    config              = deepCopySafe(build.configTab and build.configTab.input or {}),
+    skills              = M.get_skills(),
+    activeSkill         = activeSkillName,
+    perSkillDPS         = perSkillDPS,
+    perSkillReservation = perSkillReservation,
+  }
+end
+
 -- Export the full build XML (PathOfBuilding2 root element).
 function M.export_build_xml()
   if not build or not build.SaveDB then
