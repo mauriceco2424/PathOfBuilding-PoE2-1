@@ -451,6 +451,99 @@ handlers.set_flask_active = function(params)
   return { ok = true }
 end
 
+-- Tree / items misc tier -----------------------------------------------------
+
+handlers.get_tree_node_debug = function(params)
+  local res, err = BuildOps.get_tree_node_debug(params or {})
+  if not res then return { ok = false, error = err } end
+  return { ok = true, result = res }
+end
+
+handlers.get_tree_stats = function(params)
+  local res, err = BuildOps.get_tree_stats()
+  if not res then return { ok = false, error = err } end
+  return { ok = true, stats = res }
+end
+
+handlers.get_mastery_alternatives = function(params)
+  local res, err = BuildOps.get_mastery_alternatives()
+  if not res then return { ok = false, error = err } end
+  return { ok = true, result = res }
+end
+
+handlers.get_attribute_requirements = function(params)
+  local res, err = BuildOps.get_attribute_requirements()
+  if not res then return { ok = false, error = err } end
+  return { ok = true, requirements = res }
+end
+
+-- Skill config tier ----------------------------------------------------------
+
+handlers.set_skill_config = function(params)
+  local res, err = BuildOps.set_skill_config(params or {})
+  if not res then return { ok = false, error = err } end
+  return { ok = true, result = res }
+end
+
+handlers.set_batch_skill_config = function(params)
+  local res, err = BuildOps.set_batch_skill_config(params or {})
+  if not res then return { ok = false, error = err } end
+  return { ok = true, result = res }
+end
+
+-- Minion tier ----------------------------------------------------------------
+
+handlers.set_minion_config = function(params)
+  checkMemoryPressure()
+  local res, err = BuildOps.set_minion_config(params or {})
+  if not res then return { ok = false, error = err } end
+  return { ok = true, result = res }
+end
+
+handlers.get_minion_config = function(params)
+  local res, err = BuildOps.get_minion_config()
+  if not res then return { ok = false, error = err } end
+  return { ok = true, config = res }
+end
+
+-- Flask tier (lean PoE 2 rewrite) --------------------------------------------
+
+handlers.get_flask_uptime_data = function(params)
+  local res, err = BuildOps.get_flask_uptime_data()
+  if not res then return { ok = false, error = err } end
+  return { ok = true, flasks = res }
+end
+
+-- Cluster-jewel stubs — PoE 2 has no cluster jewels (POB2-7). These handlers
+-- exist only so callers that probe the API surface get a clean, explicit
+-- "not supported in PoE 2" error instead of a generic "unknown handler". If
+-- GGG adds a cluster-jewel analog to PoE 2 later, re-port from PoE 1's
+-- BuildOps.lua get_cluster_nodes / set_cluster_chain / calc_with_cluster_chain.
+
+local CLUSTER_UNSUPPORTED_MSG = "cluster jewels are not supported in PoE 2 (POB2-7)"
+handlers.get_cluster_nodes = function(params)
+  return { ok = false, error = CLUSTER_UNSUPPORTED_MSG }
+end
+handlers.set_cluster_chain = function(params)
+  return { ok = false, error = CLUSTER_UNSUPPORTED_MSG }
+end
+handlers.calc_with_cluster_chain = function(params)
+  return { ok = false, error = CLUSTER_UNSUPPORTED_MSG }
+end
+
+-- Trade query — BLOCKED on GGG's unpublished trade2 API (see
+-- poe2-ecosystem-state skill). The PoE 1 generate_trade_query is ~500 LOC
+-- built around PoE 1's stat-ID catalog and /trade/search endpoint, neither of
+-- which exists for PoE 2 as of April 2026. Stub returns a clear error so
+-- upstream services can gate feature availability on a single probe.
+handlers.generate_trade_query = function(params)
+  return {
+    ok    = false,
+    error = "generate_trade_query is blocked: GGG has not published trade2 API or stat-ID catalog for PoE 2",
+    blocked = true,
+  }
+end
+
 return {
   handlers     = handlers,
   version_meta = version_meta,

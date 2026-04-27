@@ -2504,6 +2504,431 @@ function M.remove_jewel(params)
 end
 
 -- ============================================================================
+-- Tree / items misc tier
+-- ============================================================================
+
+-- Debug helper: inspect the live passive node state PoB is using for a specific
+-- node. Useful when the LLM's mental model of a node disagrees with what the
+-- calc engine sees (e.g. "why isn't this notable contributing?"). Dumps spec /
+-- allocNode / treeNode state alongside any jewels whose radius covers the node.
+function M.get_tree_node_debug(params)
+  if not build or not build.spec then return nil, 'build/spec not initialized' end
+  if type(params) ~= 'table'    then return nil, 'invalid params' end
+  local nodeId = tonumber(params.nodeId)
+  if not nodeId then return nil, 'missing or invalid nodeId' end
+
+  local spec = build.spec
+  local function summarize(node)
+    if not node then return nil end
+    local stats = {}
+    if type(node.sd) == 'table' then
+      for _, s in ipairs(node.sd) do
+        if type(s) == 'string' then table.insert(stats, s) end
+      end
+    end
+    return {
+      id                = node.id,
+      dn                = node.dn,
+      name              = node.name,
+      icon              = node.icon,
+      activeEffectImage = node.activeEffectImage,
+      type              = node.type,
+      alloc             = node.alloc == true,
+      isKeystone        = node.isKeystone == true,
+      isNotable         = node.isNotable == true,
+      stats             = stats,
+      reminderText      = node.reminderText,
+      allocMode         = node.allocMode,        -- POB2-6
+      unlockConstraint  = node.unlockConstraint, -- POB2-11
+      -- `conqueredBy` from PoE 1 intentionally not surfaced — PoE 2 has no
+      -- Timeless Jewel / Legion conqueror system.
+    }
+  end
+
+  local influencingJewels = {}
+  for socketNodeId, itemId in pairs(spec.jewels or {}) do
+    local item = build.itemsTab and build.itemsTab.items and build.itemsTab.items[itemId] or nil
+    local socketNode = spec.nodes[socketNodeId]
+    local radiusIndex = item and item.jewelRadiusIndex or nil
+    local inRadius = false
+    if socketNode and socketNode.nodesInRadius and radiusIndex and socketNode.nodesInRadius[radiusIndex] then
+      inRadius = socketNode.nodesInRadius[radiusIndex][nodeId] ~= nil
+    end
+    if inRadius or socketNodeId == nodeId then
+      table.insert(influencingJewels, {
+        socketNodeId = socketNodeId,
+        itemId       = itemId,
+        name         = item and item.name or nil,
+        baseName     = item and item.baseName or nil,
+        radiusIndex  = radiusIndex,
+      })
+    end
+  end
+
+  return {
+    nodeId            = nodeId,
+    specNode          = summarize(spec.nodes and spec.nodes[nodeId] or nil),
+    allocNode         = summarize(spec.allocNodes and spec.allocNodes[nodeId] or nil),
+    treeNode          = summarize(spec.tree and spec.tree.nodes and spec.tree.nodes[nodeId] or nil),
+    influencingJewels = influencingJewels,
+  }
+end
+
+-- Aggregated stat contributions from the allocated passive tree. Uses modDB
+-- source filtering to pull only tree-sourced mods (gear/gems/jewels excluded).
+-- Stat list kept deliberately narrow — these are the stats most callers care
+-- about when answering "what did the tree give me?".
+function M.get_tree_stats()
+  if not build or not build.calcsTab then return nil, 'build not initialized' end
+  if build.calcsTab.BuildOutput then build.calcsTab:BuildOutput() end
+  local modDB = build.calcsTab.mainEnv and build.calcsTab.mainEnv.modDB
+  if not modDB then return nil, 'modDB unavailable' end
+  local cfg = { source = "Tree" }
+
+  return {
+    -- EHP contributors
+    lifeInc           = modDB:Sum("INC",  cfg, "Life") or 0,
+    esInc             = modDB:Sum("INC",  cfg, "EnergyShield") or 0,
+    armourInc         = modDB:Sum("INC",  cfg, "Armour", "ArmourAndEvasion", "Defences") or 0,
+    evasionInc        = modDB:Sum("INC",  cfg, "Evasion", "ArmourAndEvasion", "Defences") or 0,
+    blockBase         = modDB:Sum("BASE", cfg, "BlockChance") or 0,
+    spellSuppressBase = modDB:Sum("BASE", cfg, "SpellSuppressionChance") or 0,
+    -- Attributes
+    strBase = modDB:Sum("BASE", cfg, "Str") or 0,
+    dexBase = modDB:Sum("BASE", cfg, "Dex") or 0,
+    intBase = modDB:Sum("BASE", cfg, "Int") or 0,
+    -- DPS contributors
+    damageInc      = modDB:Sum("INC",  cfg, "Damage") or 0,
+    critChanceInc  = modDB:Sum("INC",  cfg, "CritChance") or 0,
+    critMultiBase  = modDB:Sum("BASE", cfg, "CritMultiplier") or 0,
+    dotMultiBase   = modDB:Sum("BASE", cfg, "DotMultiplier") or 0,
+    attackSpeedInc = modDB:Sum("INC",  cfg, "Speed", "AttackSpeed") or 0,
+    castSpeedInc   = modDB:Sum("INC",  cfg, "Speed", "CastSpeed") or 0,
+  }
+end
+
+-- For every allocated Mastery node, report the currently-selected effect +
+-- the alternatives the caller could swap to. Mastery data in PoB2 uses the
+-- same `node.masteryEffects` array and `spec.masterySelections` table as
+-- PoB1 — ports unchanged (POB2-11 notes).
+function M.get_mastery_alternatives()
+  if not build or not build.spec then return nil, 'build/spec not initialized' end
+  local result = {}
+  local masterySelections = build.spec.masterySelections or {}
+  local masteryEffectsRef = build.spec.tree and build.spec.tree.masteryEffects or {}
+
+  for nodeId, node in pairs(build.spec.allocNodes or {}) do
+    if node.type == "Mastery" and node.masteryEffects then
+      local currentEffectId = masterySelections[nodeId]
+      local entry = {
+        nodeId          = nodeId,
+        name            = node.name or ("Mastery " .. tostring(nodeId)),
+        currentEffectId = currentEffectId,
+        currentStats    = {},
+        alternatives    = {},
+      }
+      if currentEffectId and masteryEffectsRef[currentEffectId] then
+        entry.currentStats = masteryEffectsRef[currentEffectId].sd or {}
+      end
+      for _, effect in ipairs(node.masteryEffects) do
+        if effect.effect ~= currentEffectId then
+          local resolved = masteryEffectsRef[effect.effect]
+          table.insert(entry.alternatives, {
+            effectId = effect.effect,
+            stats    = resolved and resolved.sd or effect.stats or {},
+          })
+        end
+      end
+      if #entry.alternatives > 0 then
+        result[tostring(nodeId)] = entry
+      end
+    end
+  end
+  return result
+end
+
+-- Per-attribute requirement breakdown: who's demanding Str/Dex/Int, how much,
+-- and from where. Pulls from mainEnv.requirementsTableItems + .requirementsTableGems
+-- (the authoritative source CalcPerform uses). Also surfaces the
+-- IgnoreAttributeRequirements / OmniscienceRequirements flags (Supreme
+-- Ostentation and Crystallised Omniscience analogs in PoB2).
+function M.get_attribute_requirements()
+  if not build or not build.calcsTab then return nil, 'build not initialized' end
+  local mainEnv = build.calcsTab.mainEnv
+  if not mainEnv then return nil, 'calculations not available (run BuildOutput first)' end
+  local mainOutput = build.calcsTab.mainOutput or {}
+
+  local reqTable = {}
+  if mainEnv.requirementsTableItems then
+    for _, e in ipairs(mainEnv.requirementsTableItems) do table.insert(reqTable, e) end
+  end
+  if mainEnv.requirementsTableGems then
+    for _, e in ipairs(mainEnv.requirementsTableGems) do table.insert(reqTable, e) end
+  end
+  if #reqTable == 0 and mainEnv.requirementsTable then
+    reqTable = mainEnv.requirementsTable
+  end
+
+  local sources = { str = {}, dex = {}, int = {} }
+  for _, req in ipairs(reqTable) do
+    for _, attr in ipairs({"Str", "Dex", "Int"}) do
+      local val = req[attr]
+      if val and val > 0 then
+        local entry = { requirement = val }
+        if req.source == "Item" then
+          entry.type = "item"
+          entry.name = (req.sourceItem and req.sourceItem.name) or "Unknown Item"
+          entry.slot = req.sourceSlot or "Unknown"
+        elseif req.source == "Gem" then
+          entry.type = "gem"
+          entry.name = (req.sourceGem and req.sourceGem.nameSpec) or "Unknown Gem"
+          entry.slot = "Gem"
+        else
+          entry.type = "unknown"
+          entry.name = "Unknown"
+          entry.slot = "Unknown"
+        end
+        table.insert(sources[attr:lower()], entry)
+      end
+    end
+  end
+
+  local modDB = mainEnv.modDB
+  return {
+    str = { current = mainOutput.Str or 0, required = mainOutput.ReqStr or 0, sources = sources.str },
+    dex = { current = mainOutput.Dex or 0, required = mainOutput.ReqDex or 0, sources = sources.dex },
+    int = { current = mainOutput.Int or 0, required = mainOutput.ReqInt or 0, sources = sources.int },
+    ignoreAttrReq    = modDB and modDB:Flag(nil, "IgnoreAttributeRequirements") or nil,
+    omniRequirements = modDB and modDB:Flag(nil, "OmniscienceRequirements") or nil,
+  }
+end
+
+-- ============================================================================
+-- Skill config tier
+-- ============================================================================
+--
+-- set_skill_config / set_batch_skill_config are thin wrappers around
+-- configTab.input[varName] = value. Used by backend code that wants to flip
+-- individual skill-related config vars (multiplierPoisonOnEnemy,
+-- multiplierImpalesOnEnemy, conditionShockEffect, etc.) without the big
+-- set_config payload.
+
+function M.set_skill_config(params)
+  if not build or not build.configTab then return nil, 'build/config not initialized' end
+  if type(params) ~= 'table'           then return nil, 'invalid params' end
+  if type(params.varName) ~= 'string' or params.varName == '' then
+    return nil, 'missing or invalid varName'
+  end
+  if params.value == nil then return nil, 'missing value parameter' end
+
+  local input = build.configTab.input or {}
+  build.configTab.input = input
+  input[params.varName] = params.value
+
+  -- When value=0 for count-type configs, clear placeholder so BuildModList
+  -- doesn't fall back to an auto-calculated value. Same guard as PoE 1.
+  if params.value == 0 then
+    local placeholder = build.configTab.configSets
+      and build.configTab.configSets[build.configTab.activeConfigSetId]
+      and build.configTab.configSets[build.configTab.activeConfigSetId].placeholder
+    if placeholder then placeholder[params.varName] = nil end
+  end
+
+  if build.configTab.BuildModList then build.configTab:BuildModList() end
+  build.buildFlag = true
+  M.get_main_output()
+  return { varName = params.varName, value = params.value }
+end
+
+function M.set_batch_skill_config(params)
+  if not build or not build.configTab then return nil, 'build/config not initialized' end
+  if type(params) ~= 'table' or type(params.configs) ~= 'table' then
+    return nil, 'invalid params: expected { configs: [...] }'
+  end
+
+  local input = build.configTab.input or {}
+  build.configTab.input = input
+  local placeholder = build.configTab.configSets
+    and build.configTab.configSets[build.configTab.activeConfigSetId]
+    and build.configTab.configSets[build.configTab.activeConfigSetId].placeholder
+
+  local applied = {}
+  for _, entry in ipairs(params.configs) do
+    if type(entry.varName) == 'string' and entry.varName ~= '' and entry.value ~= nil then
+      input[entry.varName] = entry.value
+      if entry.value == 0 and placeholder then placeholder[entry.varName] = nil end
+      table.insert(applied, { varName = entry.varName, value = entry.value })
+    end
+  end
+
+  if #applied > 0 then
+    if build.configTab.BuildModList then build.configTab:BuildModList() end
+    build.buildFlag = true
+    M.get_main_output()
+  end
+  return { applied = applied, count = #applied }
+end
+
+-- ============================================================================
+-- Minion tier
+-- ============================================================================
+--
+-- PoB2 `build.spectreList` (Build.lua:44) and `data.minions` / `data.spectres`
+-- (Data.lua:955-961) have the same structure as PoB1. Handler ports cleanly.
+-- PoE 2 minion roster differs from PoE 1 — `data.minions` is populated from
+-- PoE 2's `Data/Spectres.lua`, so validation automatically matches the PoE 2
+-- catalog. Ascendancy-specific adjustments (Infernalist demons etc.) rely on
+-- the same spectreList path and drop in when backend minion-config is rewritten.
+
+function M.set_minion_config(params)
+  if not build then return nil, 'build not initialized' end
+  if type(params) ~= 'table' then return nil, 'invalid params' end
+
+  local appliedSpectres = {}
+  local invalidSpectres = {}
+  if type(params.spectreList) == 'table' then
+    wipeTable(build.spectreList)
+    for _, id in ipairs(params.spectreList) do
+      if type(id) == 'string' and build.data and build.data.minions and build.data.minions[id] then
+        table.insert(build.spectreList, id)
+        table.insert(appliedSpectres, id)
+      else
+        table.insert(invalidSpectres, tostring(id))
+      end
+    end
+  end
+
+  -- Auto-enable includeInFullDPS on the best minion-carrying socket group so
+  -- FullDPS reflects minion damage. Mirrors PoE 1 logic; skill-name matching
+  -- adapted to PoE 2 minion-summoning gems (Summon * / Raise *). If the PoE 2
+  -- roster grows (Druid's animal companions, Infernalist demons), extend
+  -- minionSkillPatterns. Drops PoE 1-only patterns: "Animate Guardian",
+  -- "Animate Weapon", "Dominating Blow", "Absolution", "Herald of Purity".
+  local minionSkillPatterns = {
+    "Raise Spectre", "Raise Zombie", "Summon Skelet", "^Summon ",
+  }
+  local minionGroupsEnabled = {}
+  local enableFullDps = params.enableFullDpsOnMinionSkills
+  if enableFullDps == nil then enableFullDps = true end
+
+  if enableFullDps and build.skillsTab then
+    local skillSetId = build.skillsTab.activeSkillSetId or 1
+    local skillSet = build.skillsTab.skillSets and build.skillsTab.skillSets[skillSetId]
+    local groups = (skillSet and skillSet.socketGroupList) or build.skillsTab.socketGroupList or {}
+
+    -- Pick the highest-gem-count socket group per minion skill — enabling
+    -- multiple groups that raise the same minion double-counts damage
+    -- (player casts Raise Spectre once).
+    local bestByName = {}
+    for idx, sg in ipairs(groups) do
+      if sg.enabled and sg.gemList then
+        local matchedSkill
+        for _, gem in ipairs(sg.gemList) do
+          local name = gem.nameSpec or ''
+          for _, pat in ipairs(minionSkillPatterns) do
+            if name:match(pat) then matchedSkill = name; break end
+          end
+          if matchedSkill then break end
+        end
+        if matchedSkill then
+          local gemCount = 0
+          for _, g in ipairs(sg.gemList) do
+            if g.enabled ~= false then gemCount = gemCount + 1 end
+          end
+          local prev = bestByName[matchedSkill]
+          if not prev or gemCount > prev.gemCount then
+            bestByName[matchedSkill] = { idx = idx, gemCount = gemCount, group = sg }
+          end
+        end
+      end
+    end
+
+    for skillName, info in pairs(bestByName) do
+      if not info.group.includeInFullDPS then
+        info.group.includeInFullDPS = true
+        if build.skillsTab.ProcessSocketGroup then
+          build.skillsTab:ProcessSocketGroup(info.group)
+        end
+        table.insert(minionGroupsEnabled, { index = info.idx, skill = skillName })
+      end
+    end
+  end
+
+  build.buildFlag = true
+  M.get_main_output()
+  return {
+    spectresApplied     = appliedSpectres,
+    spectresInvalid     = invalidSpectres,
+    minionGroupsEnabled = minionGroupsEnabled,
+  }
+end
+
+function M.get_minion_config()
+  if not build then return nil, 'build not initialized' end
+  local spectreList = {}
+  if build.spectreList then
+    for _, id in ipairs(build.spectreList) do
+      if type(id) == 'string' then table.insert(spectreList, id) end
+    end
+  end
+  return { spectreList = spectreList }
+end
+
+-- ============================================================================
+-- Flask tier — minimal PoE 2 rewrite
+-- ============================================================================
+--
+-- PoE 1's get_flask_uptime_data was ~250 LOC of charge-generation + uptime math
+-- tied to PoE 1's 5-slot flask system with per-slot recovery-rate mods and
+-- utility-flask-active conditions. PoE 2 has only 2 flask slots + 3 charm
+-- slots (POB2-10), a different charge/consume model, and no "life/mana flask
+-- recovery rate" mod family.
+--
+-- This is a LEAN port: reports per-slot flask presence + duration + base data
+-- + charges (max/used). Does NOT compute uptime / fill-time — if a caller
+-- needs that, extend with PoE 2-specific math once the flask system is
+-- formally spec'd. Good enough for "is there a flask in this slot and what is
+-- it" queries.
+
+function M.get_flask_uptime_data()
+  if not build or not build.itemsTab then return nil, 'items not initialized' end
+  local itemsTab = build.itemsTab
+  local result = {}
+
+  -- Walk flask + charm slots together — both use the same selItemId / active
+  -- pattern and callers benefit from a unified view.
+  local slotNames = { "Flask 1", "Flask 2", "Charm 1", "Charm 2", "Charm 3" }
+  for _, slotName in ipairs(slotNames) do
+    local slotCtrl = itemsTab.slots[slotName]
+    if slotCtrl and slotCtrl.selItemId and slotCtrl.selItemId > 0 then
+      local item = itemsTab.items[slotCtrl.selItemId]
+      if item and item.base and (item.base.flask or item.base.charm) then
+        local entry = {
+          slot     = slotName,
+          itemId   = slotCtrl.selItemId,
+          name     = item.name,
+          baseName = item.baseName,
+          rarity   = item.rarity,
+          active   = itemsTab.activeItemSet and itemsTab.activeItemSet[slotName]
+                       and itemsTab.activeItemSet[slotName].active or false,
+          isFlask  = item.base.flask ~= nil,
+          isCharm  = item.base.charm ~= nil,
+        }
+        if item.flaskData then
+          entry.duration    = item.flaskData.duration
+          entry.chargesMax  = item.flaskData.chargesMax
+          entry.chargesUsed = item.flaskData.chargesUsed
+          entry.lifeTotal   = item.flaskData.lifeTotal
+          entry.manaTotal   = item.flaskData.manaTotal
+        end
+        table.insert(result, entry)
+      end
+    end
+  end
+  return result
+end
+
+-- ============================================================================
 -- Config tier
 -- ============================================================================
 --
