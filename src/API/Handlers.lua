@@ -336,6 +336,13 @@ handlers.list_gems = function(params)
   return { ok = true, gems = res }
 end
 
+-- Global item-mod (affix) database for one domain (default "Item").
+handlers.list_item_mods = function(params)
+  local res, err = BuildOps.list_item_mods(params or {})
+  if not res then return { ok = false, error = err } end
+  return { ok = true, domain = (params and params.domain) or 'Item', mods = res }
+end
+
 handlers.set_main_selection = function(params)
   local ok2, err = BuildOps.set_main_selection(params or {})
   if not ok2 then return { ok = false, error = err } end

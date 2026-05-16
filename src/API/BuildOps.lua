@@ -1595,6 +1595,75 @@ function M.list_gems()
   return result
 end
 
+-- Dump PoB2's bundled item-mod tables (the affix database — Data/ModItem.lua
+-- et al., loaded at Modules/Data.lua into `data.itemMods` keyed by domain:
+-- Item / Flask / Charm / Jewel / Corruption / Runes / Exclusive /
+-- IncursionLimb). This is the authoritative mod database for the TS side
+-- (rare-item-builder, future affix-aware tools): PoB2 already parses these
+-- Lua tables, so reading them back through IPC keeps mod identifiers /
+-- weights / groups in lockstep with what PoB2's crafting + item parser use.
+-- Mirrors the DEC-14 tree principle and the DEC-17 gem-catalog approach
+-- (use PoB2's own parsed data, no duplicate, no second parser). See DEC-19.
+--
+-- Each Lua entry mixes an ARRAY part (one or more stat-text lines, no key)
+-- with a HASH part (type/affix/level/group/weight*/modTags/tradeHash/
+-- statOrder). We split them: positional strings → statLines; named keys →
+-- fields. weightKey/weightVal stay as parallel arrays (the TS side zips
+-- them). Map mods (`data.mapMods`) are deliberately NOT exposed here —
+-- atlas-adjacent, lower value, and DEC-18 has the atlas track parked.
+--
+-- params.domain — optional, default "Item". Validated against the live
+-- `data.itemMods` keys so a bad domain fails clearly and the valid set
+-- can't drift out of sync with PoB2.
+-- Precondition: a build loaded so build.data is populated (empty new_build
+-- suffices), same class as get_jewel_sockets / get_skills / list_gems.
+function M.list_item_mods(params)
+  if not build or not build.data or not build.data.itemMods then
+    return nil, 'build/game-data not initialized'
+  end
+  local itemMods = build.data.itemMods
+
+  local domain = (params and params.domain) or 'Item'
+  local domainTable = itemMods[domain]
+  if type(domainTable) ~= 'table' then
+    local valid = {}
+    for k, v in pairs(itemMods) do
+      if type(v) == 'table' then valid[#valid + 1] = k end
+    end
+    table.sort(valid)
+    return nil, string.format(
+      "unknown mod domain '%s' — valid: %s",
+      tostring(domain), table.concat(valid, ', '))
+  end
+
+  local result = {}
+  for modKey, entry in pairs(domainTable) do
+    if type(entry) == 'table' then
+      -- Array part: stat-text lines (unkeyed strings).
+      local statLines = {}
+      for _, v in ipairs(entry) do
+        if type(v) == 'string' then statLines[#statLines + 1] = v end
+      end
+
+      table.insert(result, {
+        modKey    = modKey,
+        type      = entry.type,        -- "Prefix" | "Suffix"
+        affix     = entry.affix,       -- the in-game affix name
+        statLines = statLines,
+        level     = entry.level,       -- required item/area level
+        group     = entry.group,       -- exclusivity group
+        modTags   = entry.modTags,     -- array
+        weightKey = entry.weightKey,   -- array — parallel to weightVal
+        weightVal = entry.weightVal,   -- array — spawn weight per key
+        statOrder = entry.statOrder,   -- array
+        tradeHash = entry.tradeHash,
+      })
+    end
+  end
+
+  return result
+end
+
 -- Enumerate the current build's skill gem panel. Uses the active skill set
 -- (build.skillsTab.skillSets[activeSkillSetId].socketGroupList). Drops
 -- PoB1's socket-color / socket-group-count serialization — PoE 2 gem panel
