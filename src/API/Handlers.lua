@@ -329,6 +329,13 @@ handlers.get_skills = function(params)
   return { ok = true, skills = res }
 end
 
+-- Global gem catalog (all PoB2-known gems), not the build's socketed gems.
+handlers.list_gems = function(params)
+  local res, err = BuildOps.list_gems()
+  if not res then return { ok = false, error = err } end
+  return { ok = true, gems = res }
+end
+
 handlers.set_main_selection = function(params)
   local ok2, err = BuildOps.set_main_selection(params or {})
   if not ok2 then return { ok = false, error = err } end

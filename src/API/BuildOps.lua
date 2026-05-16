@@ -1535,6 +1535,66 @@ local function activeSkillSet()
   return set
 end
 
+-- Dump the global PoE 2 gem catalog (all gems known to PoB2's bundled
+-- Data/Gems.lua), NOT the current build's socketed gems. This is the
+-- authoritative gem database for the TS side: PoB2 already parses Gems.lua
+-- natively, so reading it back through IPC guarantees the gem identifiers
+-- (gemId / gameId / variantId / grantedEffectId / name) match exactly what
+-- add_gem / calc_with_gems / findGemByIdentifier resolve against. Mirrors
+-- the DEC-14 tree-data principle (use PoB2's own parsed data, no duplicate,
+-- no second parser). Compact per-gem record; per-level stat progression is
+-- deliberately omitted (catalog/validation/autocomplete use case — a
+-- consumer that needs level scaling should query the build via calc).
+--
+-- Precondition: a build must be loaded so build.data is populated
+-- (build.data is static game data — even an empty new_build satisfies it),
+-- same precondition as get_jewel_sockets / get_skills.
+function M.list_gems()
+  if not build or not build.data or not build.data.gems then
+    return nil, 'build/game-data not initialized'
+  end
+
+  local result = {}
+  for key, gemData in pairs(build.data.gems) do
+    -- Support-gem detection: PoB2 marks them three ways (mirror get_skills).
+    local isSupport = false
+    if gemData.gemType == "Support" then isSupport = true
+    elseif gemData.tags and gemData.tags.support then isSupport = true
+    elseif gemData.grantedEffect and gemData.grantedEffect.support then isSupport = true
+    end
+
+    local tags = {}
+    if gemData.tags then
+      for k, v in pairs(gemData.tags) do
+        if v == true then tags[k] = true end
+      end
+    end
+
+    table.insert(result, {
+      -- Canonical key (the pairs() key == gemId in data.gems).
+      gemId           = key,
+      name            = gemData.name,
+      gameId          = gemData.gameId,
+      variantId       = gemData.variantId,
+      grantedEffectId = gemData.grantedEffectId
+                          or (gemData.grantedEffect and gemData.grantedEffect.id),
+      baseTypeName    = gemData.baseTypeName,
+      gemType         = gemData.gemType,
+      gemFamily       = gemData.gemFamily,
+      isSupport       = isSupport,
+      tagString       = gemData.tagString,
+      tags            = tags,
+      reqStr          = gemData.reqStr,
+      reqDex          = gemData.reqDex,
+      reqInt          = gemData.reqInt,
+      tier            = gemData.Tier,
+      naturalMaxLevel = gemData.naturalMaxLevel,
+    })
+  end
+
+  return result
+end
+
 -- Enumerate the current build's skill gem panel. Uses the active skill set
 -- (build.skillsTab.skillSets[activeSkillSetId].socketGroupList). Drops
 -- PoB1's socket-color / socket-group-count serialization — PoE 2 gem panel
